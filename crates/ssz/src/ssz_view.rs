@@ -37,6 +37,9 @@ pub enum SszView {
 }
 
 pub mod partial_column;
+mod pq;
+
+pub use pq::*;
 
 #[inline(always)]
 fn u64_le(buf: &[u8], off: usize) -> u64 {
@@ -94,6 +97,16 @@ pub(crate) fn variable_list_ok(data: &[u8], max: usize, elem_ok: impl Fn(&[u8]) 
         start = end;
     }
     true
+}
+
+/// Element count of a `List` of variable-size elements, read off its offset
+/// table's first entry.
+pub(crate) fn variable_list_len(data: &[u8]) -> usize {
+    if data.len() < 4 {
+        return 0;
+    }
+    let first = u32_le(data, 0) as usize;
+    if first > 0 && first.is_multiple_of(4) { first / 4 } else { 0 }
 }
 
 /// A container's variable-field offsets, read at `positions` in field order:
@@ -308,14 +321,18 @@ impl AttestationView {
     }
 
     pub fn check_canonical(buf: &[u8]) -> bool {
-        if buf.len() <= ATTESTATION_FIXED || u32_le(buf, 0) as usize != ATTESTATION_FIXED {
-            return false;
-        }
-        let bits = &buf[ATTESTATION_FIXED..];
-        let last = bits[bits.len() - 1];
-        last != 0 &&
-            (bits.len() - 1) * 8 + 7 - last.leading_zeros() as usize <= MAX_ATTESTING_INDICES
+        buf.len() >= ATTESTATION_FIXED &&
+            u32_le(buf, 0) as usize == ATTESTATION_FIXED &&
+            bitlist_ok(&buf[ATTESTATION_FIXED..], MAX_ATTESTING_INDICES)
     }
+}
+
+/// `Bitlist[max]`: non-empty, with its length-marking top bit set and at most
+/// `max` bits below it.
+pub(crate) fn bitlist_ok(bits: &[u8], max: usize) -> bool {
+    bits.last().is_some_and(|&last| {
+        last != 0 && (bits.len() - 1) * 8 + 7 - last.leading_zeros() as usize <= max
+    })
 }
 
 // -- ProposerSlashing (proposer_slashing) ----------------------------
