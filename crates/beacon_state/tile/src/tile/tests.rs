@@ -59,6 +59,7 @@ const MAX_EFFECTIVE_BALANCE: u64 = 32_000_000_000;
 mod gloas_production;
 #[cfg(feature = "ef_tests")]
 mod payload_preparation;
+mod pq_gossip;
 
 const TEST_RING_BYTES: usize = 1 << 20;
 const ANCHOR_ROOT: B256 = [0x01u8; 32];
@@ -4092,7 +4093,7 @@ fn ptc_vote_records_every_matching_committee_position() {
 
     let prepared = tile.prepare_ptc(&msg).expect("valid PTC message");
     assert_eq!(
-        prepared.ptc_positions.iter().map(|word| word.count_ones()).sum::<u32>(),
+        prepared.vote.ptc_positions.iter().map(|word| word.count_ones()).sum::<u32>(),
         512,
         "the test PTC repeats validator 0 in every position",
     );
@@ -6721,7 +6722,8 @@ fn concurrent_builder_configs_report_their_winning_bids_total_payment() {
             slot / SLOTS_PER_EPOCH,
         );
         let signature = test_signing::sign(0, &signing_root);
-        let checked = tile.check_bid_on_parent(&bid, &signature, |_| true);
+        let checked =
+            tile.check_bid_on_parent(&bid, gossip::BidSignature::Bls(&signature), |_| true);
         assert!(checked.is_ok(), "{checked:?}");
         let mut signed_bid = 100u32.to_le_bytes().to_vec();
         signed_bid.extend_from_slice(&signature);
