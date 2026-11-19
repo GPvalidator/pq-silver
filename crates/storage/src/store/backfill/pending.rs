@@ -6,14 +6,13 @@ use std::{
 use fxhash::FxHashMap;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
-    MAX_BLOBS_PER_BLOCK, PREFILL_SLOTS, TRead,
+    MAX_BLOBS_PER_BLOCK, PREFILL_SLOTS, SignedBlockLayout, TRead,
     column_util::{self, KzgBatchEntry, KzgScratch},
     merkle::B256,
     ssz_view::{
         BYTES_PER_KZG_COMMITMENT, DataColumnSidecarFuluView, DataColumnSidecarGloasView,
         EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadBidView, ExecutionPayloadEnvelopeView,
-        ExecutionPayloadView, NUMBER_OF_COLUMNS, SidecarLayout, SignedBeaconBlockView,
-        SignedExecutionPayloadEnvelopeView,
+        ExecutionPayloadView, NUMBER_OF_COLUMNS, SidecarLayout,
     },
 };
 
@@ -67,13 +66,13 @@ pub(in crate::store) fn sidecar_head(buffer: &[u8]) -> Option<SidecarHead> {
     (head.index < NUMBER_OF_COLUMNS as u64).then_some(head)
 }
 
+/// Either signature scheme: the slot, and with it the expected scheme, is
+/// known only once the root has found the block.
 pub(in crate::store) fn envelope_block_root(buffer: &[u8]) -> Option<B256> {
-    if !SignedExecutionPayloadEnvelopeView::check_size(buffer) {
-        return None;
-    }
-    let envelope = SignedExecutionPayloadEnvelopeView::message(buffer);
-    ExecutionPayloadEnvelopeView::check_size(envelope)
-        .then(|| *ExecutionPayloadEnvelopeView::beacon_block_root(envelope))
+    let envelope = [SignedBlockLayout::Gloas, SignedBlockLayout::Pq]
+        .into_iter()
+        .find_map(|layout| layout.envelope_message(buffer))?;
+    Some(*ExecutionPayloadEnvelopeView::beacon_block_root(envelope))
 }
 
 struct Commitments {
@@ -103,11 +102,8 @@ struct Bid {
 }
 
 impl Bid {
-    fn of(block: &[u8]) -> Option<Self> {
-        if !SignedBeaconBlockView::check_gloas_size(block) {
-            return None;
-        }
-        let bid = SignedBeaconBlockView::gloas_bid(block);
+    fn of(block: &[u8], layout: SignedBlockLayout) -> Option<Self> {
+        let bid = layout.bid(block)?;
         Some(Self {
             builder_index: ExecutionPayloadBidView::builder_index(bid),
             prev_randao: *ExecutionPayloadBidView::prev_randao(bid),
@@ -117,8 +113,8 @@ impl Bid {
         })
     }
 
-    fn matches_envelope(&self, signed: &[u8]) -> bool {
-        let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+    fn matches_envelope(&self, signed: &[u8], layout: SignedBlockLayout) -> bool {
+        let Some(envelope) = layout.envelope_message(signed) else { return false };
         let payload = ExecutionPayloadEnvelopeView::payload(envelope);
         if payload.len() < EXECUTION_PAYLOAD_FIXED_GLOAS {
             return false;
@@ -219,19 +215,19 @@ impl Pending {
         &mut self,
         slot: u64,
         block: &[u8],
-        is_gloas: bool,
+        layout: SignedBlockLayout,
         missing: u128,
         envelope: bool,
     ) {
         if (missing == 0 && !envelope) || self.blocks.contains_key(&slot) {
             return;
         }
-        let bid = match is_gloas {
-            false => None,
-            true => match Bid::of(block) {
+        let bid = match layout {
+            SignedBlockLayout::Fulu => None,
+            _ => match Bid::of(block, layout) {
                 Some(bid) => Some(bid),
                 None => {
-                    silver_log::error!(slot, "gloas block bid unreadable; nothing seeded");
+                    silver_log::error!(slot, "block bid unreadable; nothing seeded");
                     return;
                 }
             },
@@ -346,10 +342,15 @@ impl Pending {
         (None, rejected)
     }
 
-    pub(in crate::store) fn add_envelope(&mut self, signed: &[u8], slot: u64) -> bool {
+    pub(in crate::store) fn add_envelope(
+        &mut self,
+        signed: &[u8],
+        slot: u64,
+        layout: SignedBlockLayout,
+    ) -> bool {
         let Some(block) = self.blocks.get_mut(&slot) else { return false };
         let Some(bid) = block.bid.as_ref().filter(|_| block.envelope) else { return false };
-        if !bid.matches_envelope(signed) {
+        if !bid.matches_envelope(signed, layout) {
             silver_log::warn!(slot, "backfill envelope does not match its block's bid");
             return false;
         }
@@ -385,10 +386,12 @@ impl Pending {
 
 #[cfg(test)]
 mod tests {
+    use silver_common::ssz_view::SignedBeaconBlockView;
+
     use super::{
         super::fixtures::{
             BID_BLOCK_HASH, BID_BUILDER_INDEX, GLOAS_FORK_SLOT, KZG, Tc, block_bytes,
-            envelope_bytes, fulu_blob_block, gloas_block_bytes, spec,
+            envelope_bytes, fulu_blob_block, gloas_block_bytes, pq_chain_block, spec, xmss_signed,
         },
         *,
     };
@@ -407,7 +410,7 @@ mod tests {
         );
 
         let mut pending = Pending::new();
-        pending.seed_block(GLOAS_FORK_SLOT, &block, true, 0b101, false);
+        pending.seed_block(GLOAS_FORK_SLOT, &block, SignedBlockLayout::Gloas, 0b101, false);
         let held = pending.blocks[&GLOAS_FORK_SLOT].bid.as_ref().expect("a bid");
         assert_eq!(held.commitments.as_slice(), &commitments[..]);
     }
@@ -426,7 +429,10 @@ mod tests {
             envelope: false,
         };
         let fulu = fresh(None);
-        let gloas = fresh(Bid::of(&gloas_block_bytes(GLOAS_FORK_SLOT, &[0u8; 48])));
+        let gloas = fresh(Bid::of(
+            &gloas_block_bytes(GLOAS_FORK_SLOT, &[0u8; 48]),
+            SignedBlockLayout::Gloas,
+        ));
         assert!(gloas.bid.is_some());
 
         // Contents are irrelevant: the layout arm is what refuses.
@@ -459,7 +465,7 @@ mod tests {
         let mut tc = Tc::new("backfill_kzg_batch", 1 << 22);
         let mut pending = Pending::new();
         let requested = 0b1011u128; // columns 0, 1, 3
-        pending.seed_block(20, &block, false, requested, false);
+        pending.seed_block(20, &block, SignedBlockLayout::Fulu, requested, false);
 
         for &col in &[0usize, 1] {
             let (verified, rejected) = add(&mut pending, &mut tc, &sidecars[col], 20, 7, now);
@@ -485,7 +491,7 @@ mod tests {
         let (block, sidecars) = fulu_fixture(20);
         let mut tc = Tc::new("backfill_kzg_forged", 1 << 22);
         let mut pending = Pending::new();
-        pending.seed_block(20, &block, false, 0b11, false);
+        pending.seed_block(20, &block, SignedBlockLayout::Fulu, 0b11, false);
 
         let mut forged = sidecars[1].clone();
         let proofs_off = column_util::data_column_sidecar_len(2) - 2 * 48;
@@ -515,7 +521,7 @@ mod tests {
         let (block, sidecars) = fulu_fixture(20);
         let mut tc = Tc::new("backfill_kzg_expire", 1 << 22);
         let mut pending = Pending::new();
-        pending.seed_block(20, &block, false, 0b11, false);
+        pending.seed_block(20, &block, SignedBlockLayout::Fulu, 0b11, false);
         add(&mut pending, &mut tc, &sidecars[0], 20, 7, now);
 
         pending.expire_incomplete(now + INCOMPLETE_BLOCK_TIMEOUT - Duration::from_millis(1));
@@ -530,8 +536,8 @@ mod tests {
     #[test]
     fn moving_on_drops_blocks_outside_the_range() {
         let mut pending = Pending::new();
-        pending.seed_block(40, &block_bytes(40, [0; 32]), false, 0b1, false);
-        pending.seed_block(72, &block_bytes(72, [0; 32]), false, 0b1, false);
+        pending.seed_block(40, &block_bytes(40, [0; 32]), SignedBlockLayout::Fulu, 0b1, false);
+        pending.seed_block(72, &block_bytes(72, [0; 32]), SignedBlockLayout::Fulu, 0b1, false);
         pending.retain_range(64, 96);
         assert!(!pending.blocks.contains_key(&40), "below the range");
         assert!(pending.blocks.contains_key(&72), "inside it");
@@ -544,39 +550,75 @@ mod tests {
         const ROOT: B256 = [0x5A; 32];
         let block = gloas_block_bytes(GLOAS_FORK_SLOT, &[]);
         let mut pending = Pending::new();
-        pending.seed_block(GLOAS_FORK_SLOT, &block, true, 0, true);
+        pending.seed_block(GLOAS_FORK_SLOT, &block, SignedBlockLayout::Gloas, 0, true);
         assert!(pending.blocks.contains_key(&GLOAS_FORK_SLOT), "a gloas block carries a bid");
 
         let good = envelope_bytes(ROOT, BID_BUILDER_INDEX, BID_BLOCK_HASH);
         let wrong_hash = envelope_bytes(ROOT, BID_BUILDER_INDEX, [0xFF; 32]);
         let wrong_builder = envelope_bytes(ROOT, 0, BID_BLOCK_HASH);
+        let xmss_signed = xmss_signed(&good);
         for (envelope, slot, why) in [
             (&wrong_hash, GLOAS_FORK_SLOT, "payload block_hash the bid did not commit to"),
             (&wrong_builder, GLOAS_FORK_SLOT, "another builder's payload"),
             (&good, GLOAS_FORK_SLOT + 1, "an envelope for a block we were not asked about"),
+            (&xmss_signed, GLOAS_FORK_SLOT, "a signature scheme its fork does not use"),
         ] {
-            assert!(!pending.add_envelope(envelope, slot), "refuses {why}");
+            assert!(
+                !pending.add_envelope(envelope, slot, SignedBlockLayout::Gloas),
+                "refuses {why}"
+            );
         }
         assert!(pending.blocks.contains_key(&GLOAS_FORK_SLOT), "a refusal leaves the block held");
 
-        assert!(pending.add_envelope(&good, GLOAS_FORK_SLOT), "accepted");
+        assert!(pending.add_envelope(&good, GLOAS_FORK_SLOT, SignedBlockLayout::Gloas), "accepted");
         assert!(!pending.blocks.contains_key(&GLOAS_FORK_SLOT), "acceptance retires the block");
+    }
+
+    #[test]
+    fn pq_envelope_binds_to_its_blocks_bid() {
+        const ROOT: B256 = [0x5A; 32];
+        let block = pq_chain_block(GLOAS_FORK_SLOT, [0; 32], &[]);
+        let mut pending = Pending::new();
+        pending.seed_block(GLOAS_FORK_SLOT, &block, SignedBlockLayout::Pq, 0, true);
+        assert!(pending.blocks.contains_key(&GLOAS_FORK_SLOT), "a PQ block carries a bid");
+
+        let bls_signed = envelope_bytes(ROOT, BID_BUILDER_INDEX, BID_BLOCK_HASH);
+        let refused = pending.add_envelope(&bls_signed, GLOAS_FORK_SLOT, SignedBlockLayout::Pq);
+        assert!(!refused, "refuses a BLS-signed envelope for a PQ block");
+        let accepted =
+            pending.add_envelope(&xmss_signed(&bls_signed), GLOAS_FORK_SLOT, SignedBlockLayout::Pq);
+        assert!(accepted, "accepts the XMSS-signed one");
+    }
+
+    #[test]
+    fn envelope_block_root_reads_either_signature_scheme() {
+        const ROOT: B256 = [0x5A; 32];
+        let bls_signed = envelope_bytes(ROOT, BID_BUILDER_INDEX, BID_BLOCK_HASH);
+        assert_eq!(envelope_block_root(&bls_signed), Some(ROOT));
+        assert_eq!(envelope_block_root(&xmss_signed(&bls_signed)), Some(ROOT));
+        assert_eq!(envelope_block_root(&bls_signed[..120]), None);
     }
 
     #[test]
     fn blocks_without_a_readable_bid_need_no_envelope() {
         let mut pending = Pending::new();
-        pending.seed_block(1, &block_bytes(1, [0; 32]), false, 0, true);
+        pending.seed_block(1, &block_bytes(1, [0; 32]), SignedBlockLayout::Fulu, 0, true);
         assert!(
             pending.blocks.contains_key(&1),
             "held, since the caller said an envelope is missing"
         );
         assert!(
-            !pending.add_envelope(&envelope_bytes([0; 32], 0, [0; 32]), 1),
+            !pending.add_envelope(&envelope_bytes([0; 32], 0, [0; 32]), 1, SignedBlockLayout::Fulu),
             "but no bid can match"
         );
 
-        pending.seed_block(GLOAS_FORK_SLOT, &block_bytes(GLOAS_FORK_SLOT, [0; 32]), true, 0, true);
+        pending.seed_block(
+            GLOAS_FORK_SLOT,
+            &block_bytes(GLOAS_FORK_SLOT, [0; 32]),
+            SignedBlockLayout::Gloas,
+            0,
+            true,
+        );
         assert!(!pending.blocks.contains_key(&GLOAS_FORK_SLOT), "no bid, nothing held");
     }
 }

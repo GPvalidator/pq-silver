@@ -3,8 +3,8 @@ use std::{sync::Arc, time::Instant};
 use fxhash::FxHashMap;
 use silver_beacon_state_data::{SLOTS_PER_EPOCH, SpecConfig};
 use silver_common::{
-    DataKind, PREFILL_SLOTS, PeerEvent, Prefill, RpcOffence, RpcSeverity, SyncNeed, TRead,
-    merkle::B256, ssz_view::MAX_PAYLOAD_SIZE,
+    DataKind, PREFILL_SLOTS, PeerEvent, Prefill, RpcOffence, RpcSeverity, SignedBlockLayout,
+    SyncNeed, TRead, merkle::B256, ssz_view::MAX_PAYLOAD_SIZE,
 };
 
 use super::{
@@ -187,19 +187,26 @@ impl History {
                 continue;
             }
             let slot = prefill.start + offset;
-            if !coverage::read_block(store_dir, slot, &mut block) {
+            let Some(layout) = coverage::read_block(store_dir, slot, &mut block, &self.spec) else {
                 silver_log::error!(slot, "held block unreadable; its columns stay missing");
                 continue;
-            }
-            self.seed_pending(slot, &block, finalized);
+            };
+            self.seed_pending(slot, &block, layout, finalized);
         }
         self.block_scratch = block;
     }
-    pub(super) fn seed_pending(&mut self, slot: u64, block: &[u8], finalized: &Finalized) {
+
+    pub(super) fn seed_pending(
+        &mut self,
+        slot: u64,
+        block: &[u8],
+        layout: SignedBlockLayout,
+        finalized: &Finalized,
+    ) {
         let is_gloas = self.spec.is_gloas_at_slot(slot);
         let missing = finalized.coverage().columns_missing(slot);
         let envelope = is_gloas && finalized.coverage().envelope_missing(slot);
-        self.pending.seed_block(slot, block, is_gloas, missing, envelope);
+        self.pending.seed_block(slot, block, layout, missing, envelope);
     }
 
     /// Every served block waits for the chain to reach it, held or not: one
@@ -288,7 +295,8 @@ impl History {
             emit(IoEvent::Need(finalized.persisted(DataKind::Envelope, slot, None)));
             return;
         }
-        if self.pending.add_envelope(buffer, slot) {
+        let layout = SignedBlockLayout::at_slot(&self.spec, slot);
+        if self.pending.add_envelope(buffer, slot, layout) {
             write_queue.push_back(PendingWrite::BackfillEnvelope { slot, ssz: signed });
         }
     }
