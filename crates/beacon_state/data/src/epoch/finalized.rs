@@ -1,12 +1,13 @@
 use flux_profiler::timed;
 
 use super::{
-    delta::EpochStateDelta, effective_increments::EffectiveIncrements, ptc_window::PtcWindow,
+    aggregation_committee_window::AggregationCommitteeWindow, delta::EpochStateDelta,
+    effective_increments::EffectiveIncrements, ptc_window::PtcWindow,
 };
 use crate::{
     decompose::{
         common::{F17, F18, F19, F20, F29, F37, read_checkpoint, read_fork, u64_le},
-        gloas::{G_DEPOSIT_BALANCE_TO_CONSUME, G_PROPOSER_LOOKAHEAD, G_PTC_WINDOW},
+        gloas::{G_DEPOSIT_BALANCE_TO_CONSUME, G_PROPOSER_LOOKAHEAD, G_PTC_WINDOW, GloasLayout},
     },
     gloas::{PTC_SIZE, zeroed_ptc_window},
     types::EpochState,
@@ -20,6 +21,8 @@ pub struct EpochStateFinalized {
     /// [New in Gloas]
     pub(crate) ptc_window: PtcWindow,
     pub(crate) increments: EffectiveIncrements,
+    /// [New in PQ]
+    pub(crate) aggregation_committee_window: AggregationCommitteeWindow,
 }
 
 impl EpochStateFinalized {
@@ -43,6 +46,7 @@ impl EpochStateFinalized {
         self.state = delta.state;
         self.ptc_window.clone_from(&delta.ptc_window);
         self.increments.clone_from(&delta.increments);
+        self.aggregation_committee_window.clone_from(&delta.aggregation_committee_window);
     }
 
     #[timed]
@@ -50,18 +54,27 @@ impl EpochStateFinalized {
         Self { state: read_epoch_state(ssz, F37, F29), ..Default::default() }
     }
 
-    pub(crate) fn from_ssz_gloas(ssz: &[u8]) -> Self {
+    pub(crate) fn from_ssz_gloas(
+        ssz: &[u8],
+        layout: GloasLayout,
+        aggregation_committee_window: AggregationCommitteeWindow,
+    ) -> Self {
         let mut ptc_window = zeroed_ptc_window();
         for (c, committee) in ptc_window.iter_mut().enumerate() {
             for (j, v) in committee.iter_mut().enumerate() {
-                *v = u64_le(ssz, G_PTC_WINDOW + (c * PTC_SIZE + j) * 8);
+                *v = u64_le(ssz, layout.at(G_PTC_WINDOW) + (c * PTC_SIZE + j) * 8);
             }
         }
 
         Self {
-            state: read_epoch_state(ssz, G_PROPOSER_LOOKAHEAD, G_DEPOSIT_BALANCE_TO_CONSUME),
+            state: read_epoch_state(
+                ssz,
+                layout.at(G_PROPOSER_LOOKAHEAD),
+                layout.at(G_DEPOSIT_BALANCE_TO_CONSUME),
+            ),
             ptc_window: PtcWindow::new(ptc_window),
             increments: EffectiveIncrements::default(),
+            aggregation_committee_window,
         }
     }
 }
