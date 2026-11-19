@@ -30,7 +30,7 @@ fn payout(bid: &ExecutionPayloadBid) -> u128 {
 
 struct BidPoolEntry {
     bid: ExecutionPayloadBid,
-    signature: [u8; 96],
+    signed_ssz: Box<[u8]>,
 }
 
 /// Highest-payout verified bid per branch, and the builders already heard
@@ -51,24 +51,24 @@ impl BidPool {
     }
 
     /// `bid` passed validation and its signature verified.
-    pub fn add(&mut self, bid: ExecutionPayloadBid, signature: [u8; 96]) {
+    pub fn add(&mut self, bid: ExecutionPayloadBid, signed_ssz: &[u8]) {
         let branch = BidBranch::from(&bid);
         self.seen.insert((branch, bid.builder_index));
         match self.best.entry(branch) {
             Entry::Occupied(mut best) => {
                 if payout(&bid) > payout(&best.get().bid) {
-                    best.insert(BidPoolEntry { bid, signature });
+                    best.insert(BidPoolEntry { bid, signed_ssz: signed_ssz.into() });
                 }
             }
             Entry::Vacant(slot) => {
-                slot.insert(BidPoolEntry { bid, signature });
+                slot.insert(BidPoolEntry { bid, signed_ssz: signed_ssz.into() });
             }
         }
     }
 
     /// Left in place: a retried request commits to the same bid.
-    pub fn best(&self, branch: &BidBranch) -> Option<(&ExecutionPayloadBid, &[u8; 96])> {
-        self.best.get(branch).map(|BidPoolEntry { bid, signature }| (bid, signature))
+    pub fn best(&self, branch: &BidBranch) -> Option<(&ExecutionPayloadBid, &[u8])> {
+        self.best.get(branch).map(|entry| (&entry.bid, entry.signed_ssz.as_ref()))
     }
 
     /// Next-slot bids arrive during the current slot, so they are kept.
@@ -96,6 +96,12 @@ mod tests {
         }
     }
 
+    fn add_bls(pool: &mut BidPool, bid: ExecutionPayloadBid, signature: [u8; 96]) {
+        let mut signed = Vec::new();
+        bid.write_signed_ssz(&signature, &mut signed);
+        pool.add(bid, &signed);
+    }
+
     fn branch(slot: Slot, parent: u8, hash: u8) -> BidBranch {
         BidBranch::from(&bid(slot, parent, hash, 0, 0))
     }
@@ -103,7 +109,7 @@ mod tests {
     #[test]
     fn a_builder_is_heard_once_per_branch() {
         let mut pool = BidPool::default();
-        pool.add(bid(5, 1, 1, 7, 10), [0; 96]);
+        add_bls(&mut pool, bid(5, 1, 1, 7, 10), [0; 96]);
         assert!(!pool.is_candidate(&bid(5, 1, 1, 7, 20)), "same builder, same branch");
         assert!(
             pool.is_candidate(&bid(5, 1, 2, 7, 20)),
@@ -115,18 +121,22 @@ mod tests {
     #[test]
     fn only_a_strictly_higher_payout_competes() {
         let mut pool = BidPool::default();
-        pool.add(bid(5, 1, 1, 7, 10), [0; 96]);
+        add_bls(&mut pool, bid(5, 1, 1, 7, 10), [0; 96]);
         assert!(!pool.is_candidate(&bid(5, 1, 1, 8, 10)), "a tie is not higher");
         assert!(pool.is_candidate(&bid(5, 1, 1, 8, 11)));
-        pool.add(bid(5, 1, 1, 8, 11), [1; 96]);
-        let (best, signature) = pool.best(&branch(5, 1, 1)).unwrap();
-        assert_eq!((best.builder_index, *signature), (8, [1; 96]));
+        add_bls(&mut pool, bid(5, 1, 1, 8, 11), [1; 96]);
+        let (best, signed) = pool.best(&branch(5, 1, 1)).unwrap();
+        assert_eq!(best.builder_index, 8);
+        assert_eq!(
+            silver_ssz::ssz_view::SignedExecutionPayloadBidView::signature(signed),
+            &[1; 96]
+        );
     }
 
     #[test]
     fn execution_payment_counts_without_overflow() {
         let mut pool = BidPool::default();
-        pool.add(bid(5, 1, 1, 7, 10), [0; 96]);
+        add_bls(&mut pool, bid(5, 1, 1, 7, 10), [0; 96]);
         let mut paid = bid(5, 1, 1, 8, 5);
         paid.execution_payment = 6;
         assert!(pool.is_candidate(&paid), "5 + 6 beats 10");
@@ -134,15 +144,15 @@ mod tests {
         let mut extreme = bid(5, 1, 1, 9, u64::MAX);
         extreme.execution_payment = u64::MAX;
         assert!(pool.is_candidate(&extreme));
-        pool.add(extreme, [2; 96]);
+        add_bls(&mut pool, extreme, [2; 96]);
         assert_eq!(pool.best(&branch(5, 1, 1)).unwrap().0.builder_index, 9);
     }
 
     #[test]
     fn a_new_slot_keeps_next_slot_bids() {
         let mut pool = BidPool::default();
-        pool.add(bid(5, 1, 1, 7, 10), [0; 96]);
-        pool.add(bid(6, 1, 1, 7, 10), [0; 96]);
+        add_bls(&mut pool, bid(5, 1, 1, 7, 10), [0; 96]);
+        add_bls(&mut pool, bid(6, 1, 1, 7, 10), [0; 96]);
         pool.on_slot(6);
         assert!(pool.best(&branch(5, 1, 1)).is_none());
         assert!(!pool.is_candidate(&bid(6, 1, 1, 7, 20)), "slot 6's seen set survives");
