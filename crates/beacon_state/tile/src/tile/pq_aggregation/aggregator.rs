@@ -12,7 +12,7 @@ use silver_common::{
 use super::{
     Aggregate, VerifiedVote,
     claims::Vote,
-    leaf::{LeafAggregation, LeafKey},
+    leaf::{LeafAggregation, LeafAttestation, LeafKey},
     merge::MergeAggregation,
     strategy::Batch,
 };
@@ -200,16 +200,16 @@ impl PqAggregator {
         producers.produce(LeanVmReq { request_id, body });
     }
 
-    pub fn aggregate_ssz(
+    pub fn aggregate(
         &self,
         slot: Slot,
         committee_index: u64,
         data_root: B256,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<LeafAttestation<'_>> {
         self.leaves.get(&LeafKey { slot, committee_index, data_root })?.attestation(committee_index)
     }
 
-    pub fn block_proof(&self, slot: Slot) -> Option<(Vec<&[u8]>, &[u8])> {
+    pub fn block_proof(&self, slot: Slot) -> Option<(impl Iterator<Item = &[u8]> + Clone, &[u8])> {
         self.merges.get(&slot)?.block_proof()
     }
 
