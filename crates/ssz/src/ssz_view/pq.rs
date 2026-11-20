@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     body_offsets::{BlockBodyError, OperationKind},
+    merkle::bitlist_len,
     ssz_hash_pq::ExecutionRequestsPqView,
 };
 
@@ -101,6 +102,53 @@ impl AttestationPqView {
         buf.len() >= ATTESTATION_PQ_FIXED &&
             u32_le(buf, 0) as usize == ATTESTATION_PQ_FIXED &&
             bitlist_ok(&buf[ATTESTATION_PQ_FIXED..], MAX_ATTESTING_INDICES_PQ)
+    }
+
+    /// The committee index and set positions of an attestation of one
+    /// committee. `None` unless `buf` is canonical, names exactly one
+    /// committee and has at most `MAX_VALIDATORS_PER_COMMITTEE` positions.
+    pub fn one_committee_positions(
+        buf: &[u8],
+    ) -> Option<(usize, impl Iterator<Item = usize> + '_)> {
+        if !Self::check_canonical(buf) {
+            return None;
+        }
+        let committees = u16::from_le_bytes(*Self::committee_bits(buf));
+        let bits = Self::aggregation_bits(buf);
+        let len = bitlist_len(bits);
+        if committees.count_ones() != 1 || len > MAX_VALIDATORS_PER_COMMITTEE {
+            return None;
+        }
+        let positions = (0..len).filter(move |&p| bits[p / 8] >> (p % 8) & 1 == 1);
+        Some((committees.trailing_zeros() as usize, positions))
+    }
+
+    /// An attestation of one committee: `positions` are indices into it.
+    /// `None` if the committee, its size or a position is out of range.
+    pub fn encode_one_committee(
+        data: &[u8; ATTESTATION_DATA_SIZE],
+        committee_index: usize,
+        committee_len: usize,
+        positions: impl IntoIterator<Item = usize>,
+    ) -> Option<Vec<u8>> {
+        if committee_index >= MAX_COMMITTEES_PER_SLOT_PQ ||
+            committee_len > MAX_VALIDATORS_PER_COMMITTEE
+        {
+            return None;
+        }
+        let mut out = vec![0u8; ATTESTATION_PQ_FIXED + committee_len / 8 + 1];
+        out[..4].copy_from_slice(&(ATTESTATION_PQ_FIXED as u32).to_le_bytes());
+        out[4..4 + ATTESTATION_DATA_SIZE].copy_from_slice(data);
+        out[4 + ATTESTATION_DATA_SIZE + committee_index / 8] |= 1 << (committee_index % 8);
+        let bits = &mut out[ATTESTATION_PQ_FIXED..];
+        for position in positions {
+            if position >= committee_len {
+                return None;
+            }
+            bits[position / 8] |= 1 << (position % 8);
+        }
+        bits[committee_len / 8] |= 1 << (committee_len % 8);
+        Some(out)
     }
 }
 

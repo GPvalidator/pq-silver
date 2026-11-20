@@ -7578,3 +7578,324 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
     rig.verdict(A_ROOT, PayloadValidationStatus::Valid);
     assert_eq!(rig.crank().last_head(), b(false));
 }
+
+mod pq_aggregator {
+    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
+    use silver_ssz::ssz_view::{AttestationPqView, SINGLE_ATT_PQ_SIZE};
+
+    use super::*;
+    use crate::tile::pq_aggregation::{
+        Aggregate, Claim, VerifiedVote, test_util::attestation, wire::AggregateResponse,
+    };
+
+    const SLOT: Slot = 40;
+    const DATA_ROOT: B256 = [0xDD; 32];
+    const COMMITTEE_LEN: usize = 8;
+    const ROOT_A: B256 = [0xAA; 32];
+    const ROOT_B: B256 = [0xBB; 32];
+
+    struct Rig {
+        tile: BeaconStateTile,
+        gossip: TProducer,
+        adapter: SpineAdapter<SilverSpine>,
+        sink: SpineAdapter<SilverSpine>,
+        _spine: TestSpine,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
+            let (mut tile, gossip, _rpc, mut spine, mut adapter) =
+                tile_with_producers_on(SLOT, BeaconState::empty_test(0), spec);
+            // A frozen clock, 1 s into the slot, so deadlines do not race the test.
+            tile.ticker.set_since_genesis_ms(SLOT * 12_000 + 1_000);
+            let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
+            sink.consume(|_: LeanVmReq, _| {});
+            sink.consume(|_: BeaconApiResponse, _| {});
+            tile.consume_shared(&mut adapter);
+            Self { tile, gossip, adapter, sink, _spine: spine }
+        }
+
+        /// What the transport publishes when the connection drops while a
+        /// request is out, taken in through the tile's own consume path.
+        fn disconnect(&mut self, request_id: u64) {
+            self.sink.produce(LeanVmResp { request_id, body: None });
+            self.sink.produce(LeanVmHealthEvent { ready: false });
+            self.tile.consume_shared(&mut self.adapter);
+            self.send_next();
+        }
+
+        /// What the tile does at the end of each loop.
+        fn send_next(&mut self) {
+            let tile = &mut self.tile;
+            let tcache = &mut tile.events_producer;
+            tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut self.adapter.producers);
+        }
+
+        fn ready(&mut self) {
+            self.tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+            self.send_next();
+        }
+
+        fn vote(&mut self, tag: u8) {
+            self.vote_on(DATA_ROOT, tag);
+        }
+
+        fn vote_on(&mut self, data_root: B256, tag: u8) {
+            self.vote_in(SLOT, data_root, tag);
+        }
+
+        fn vote_in(&mut self, slot: Slot, data_root: B256, tag: u8) {
+            let mut single = [0u8; SINGLE_ATT_PQ_SIZE];
+            single[16..24].copy_from_slice(&slot.to_le_bytes());
+            let vote = VerifiedVote {
+                single: &single,
+                data_root,
+                message: [tag; 32],
+                pubkey: [tag; 32],
+                committee_position: tag as usize,
+                committee_len: COMMITTEE_LEN,
+            };
+            self.tile.pq_aggregator.add_vote(vote, &self.tile.ticker);
+            self.send_next();
+        }
+
+        fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
+            let attestation = attestation(0, 0..claims.len());
+            let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
+            self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap(), &self.tile.ticker);
+            self.send_next();
+        }
+
+        /// Fills the tcache until the returned reservation drops.
+        fn fill_tcache(&mut self) -> TReservation {
+            let tcache = &mut self.tile.events_producer;
+            let pin = tcache.reserve(1, false).unwrap();
+            for chunk in [4096, 16] {
+                while tcache.write_with(chunk, |_| {}).is_some() {}
+            }
+            pin
+        }
+
+        fn tags(&mut self, request: &LeanVmReq) -> Vec<u8> {
+            (1..COMMITTEE_LEN as u8).filter(|&tag| self.carries(request, tag)).collect()
+        }
+
+        fn carries(&mut self, request: &LeanVmReq, tag: u8) -> bool {
+            let body = self.tile.events_producer.read_buffer(request.body).unwrap();
+            body.windows(64).any(|window| window == [tag; 64])
+        }
+
+        fn requests(&mut self) -> Vec<LeanVmReq> {
+            let mut requests = Vec::new();
+            self.sink.consume(|request: LeanVmReq, _| requests.push(request));
+            requests
+        }
+
+        fn request(&mut self) -> LeanVmReq {
+            let requests = self.requests();
+            assert_eq!(requests.len(), 1, "one request is in flight");
+            requests[0]
+        }
+
+        fn respond(&mut self, request_id: u64, claims: &[Claim]) {
+            let body = AggregateResponse::encode(claims, b"proof");
+            let body = self.gossip.write_with(body.len(), |out| out.copy_from_slice(&body));
+            let resp = LeanVmResp { request_id, body };
+            self.tile.pq_aggregator.on_response(resp, &mut self.tile.reader);
+            self.send_next();
+        }
+
+        fn served(&mut self) -> Option<Vec<u8>> {
+            self.tile.serve_aggregate(1, SLOT, 0, DATA_ROOT, &mut self.adapter.producers);
+            let mut served = None;
+            self.sink.consume(|response: BeaconApiResponse, _| {
+                if let BeaconApiResponse::AggregateAttestation { ssz, .. } = response {
+                    served = ssz;
+                }
+            });
+            Some(self.tile.events_producer.read_buffer(served?).unwrap().to_vec())
+        }
+    }
+
+    #[test]
+    fn a_vote_sends_a_request_once_the_leanvm_sidecar_is_ready() {
+        let mut rig = Rig::new();
+        rig.vote_on(ROOT_A, 1);
+        rig.vote_on(ROOT_B, 3);
+        assert!(rig.requests().is_empty());
+        rig.ready();
+        let request = rig.request();
+        let body = rig.tile.events_producer.read_buffer(request.body).unwrap();
+        assert_eq!(body[0], 1, "aggregate op");
+    }
+
+    #[test]
+    fn a_response_is_served_as_a_canonical_attestation() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let request_id = rig.request().request_id;
+        assert!(rig.served().is_none(), "no proof yet");
+
+        rig.respond(request_id, &[[1; 64]]);
+        let ssz = rig.served().expect("a best proof");
+        assert!(AttestationPqView::check_canonical(&ssz));
+        assert_eq!(AttestationPqView::committee_bits(&ssz), &[1, 0]);
+        assert_eq!(AttestationPqView::aggregation_bits(&ssz), [0b10, 1], "only position 1 is set");
+    }
+
+    #[test]
+    fn a_vote_outside_the_committee_is_dropped() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(COMMITTEE_LEN as u8);
+        assert!(rig.requests().is_empty());
+    }
+
+    #[test]
+    fn a_vote_after_the_deadline_is_dropped() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let due_ms = rig.tile.ticker.aggregate_due(SLOT).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(due_ms);
+        rig.vote(1);
+        assert!(rig.requests().is_empty());
+    }
+
+    #[test]
+    fn an_aggregate_is_merged_into_the_block_proof() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.aggregate(SLOT + 1, &[[1; 64], [2; 64]]);
+        let request = rig.request();
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
+
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
+        assert_eq!(attestations, [attestation(0, 0..2).as_slice()]);
+        assert_eq!(proof, b"proof");
+    }
+
+    #[test]
+    fn leaves_go_by_earliest_deadline_then_most_new_votes() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote_on(ROOT_A, 1);
+        let a1 = rig.request();
+        rig.vote_in(SLOT + 1, ROOT_B, 2);
+        rig.vote_in(SLOT + 1, ROOT_B, 3);
+        rig.vote_on(ROOT_B, 4);
+        rig.vote_on(ROOT_A, 5);
+        rig.vote_on(ROOT_A, 6);
+        rig.vote_on(ROOT_A, 1);
+
+        rig.respond(a1.request_id, &[[1; 64]]);
+        let a2 = rig.request();
+        assert_eq!(rig.tags(&a2), [1, 5, 6], "two new votes beat one; vote 1 again adds none");
+
+        rig.respond(a2.request_id, &[[1; 64], [5; 64], [6; 64]]);
+        let b = rig.request();
+        assert_eq!(rig.tags(&b), [4], "the earlier deadline beats more votes");
+
+        rig.respond(b.request_id, &[[4; 64]]);
+        let later = rig.request();
+        assert_eq!(rig.tags(&later), [2, 3]);
+    }
+
+    #[test]
+    fn earlier_deadlines_go_first_whatever_the_kind_and_ties_go_to_the_lower_key() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote_on(ROOT_A, 1);
+        let mut request = rig.request();
+        rig.aggregate(SLOT + 2, &[[10; 64]]);
+        rig.vote_in(SLOT + 1, ROOT_A, 4);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.vote_on(ROOT_B, 3);
+        rig.vote_on(ROOT_A, 2);
+        assert!(rig.requests().is_empty(), "the others wait");
+
+        let mut order = Vec::new();
+        let answers: [&[Claim]; 5] =
+            [&[[1; 64]], &[[1; 64], [2; 64]], &[[3; 64]], &[[9; 64]], &[[4; 64]]];
+        for (request_id, claims) in (1..).zip(answers) {
+            rig.respond(request.request_id, claims);
+            request = rig.request();
+            assert_eq!(request.request_id, request_id);
+            let merge = [9, 10].into_iter().find(|&tag| rig.carries(&request, tag));
+            order.push(merge.map_or_else(|| rig.tags(&request), |tag| vec![tag]));
+        }
+        let by_deadline = [vec![1, 2], vec![3], vec![9], vec![4], vec![10]];
+        assert_eq!(order, by_deadline, "earliest deadline, then the lower root");
+    }
+
+    #[test]
+    fn an_aggregate_at_its_block_slot_start_is_dropped() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let start_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(start_ms);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.tile.ticker.set_since_genesis_ms(start_ms - 1);
+        rig.aggregate(SLOT + 1, &[[10; 64]]);
+        let request = rig.request();
+        assert!(rig.carries(&request, 10), "an earlier arrival would go first");
+    }
+
+    #[test]
+    fn a_disconnect_costs_one_failure_and_nothing_is_sent_until_ready() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote_on(ROOT_A, 1);
+        rig.vote_on(ROOT_B, 3);
+        let first = rig.request();
+        assert_eq!(rig.tags(&first), [1]);
+
+        rig.disconnect(first.request_id);
+        assert!(rig.requests().is_empty(), "no request goes to a leanvm sidecar that is down");
+
+        rig.ready();
+        let second = rig.request();
+        assert_eq!(rig.tags(&second), [1], "A ties with B and has the lower key");
+        rig.respond(first.request_id, &[[1; 64]]);
+        assert!(rig.requests().is_empty(), "a late answer to the lost request is ignored");
+
+        rig.respond(second.request_id, &[[1; 64]]);
+        let third = rig.request();
+        assert_eq!(rig.tags(&third), [3]);
+    }
+
+    #[test]
+    fn a_full_tcache_retries_without_a_failure() {
+        let mut rig = Rig::new();
+        rig.ready();
+        let pin = rig.fill_tcache();
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        for _ in 0..5 {
+            rig.send_next();
+        }
+        assert!(rig.requests().is_empty(), "the tcache is full");
+
+        drop(pin);
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 9), "six misses did not stop the merge");
+    }
+
+    #[test]
+    fn a_pruned_request_keeps_the_leanvm_sidecar_busy_until_its_response() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.vote(1);
+        let stale = rig.request();
+        rig.tile.pq_aggregator.prune_before(SLOT + 1);
+        rig.aggregate(SLOT + 2, &[[9; 64]]);
+        assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
+
+        rig.respond(stale.request_id, &[[1; 64]]);
+        assert!(rig.served().is_none(), "the pruned leaf is gone");
+        let merge = rig.request();
+        assert!(rig.carries(&merge, 9), "the merge goes out");
+    }
+}

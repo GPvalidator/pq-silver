@@ -2,6 +2,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use silver_chain_spec::SpecConfig;
 
+use crate::Nanos;
+
 type Slot = u64;
 
 /// Consensus-spec clock-skew allowance for slot-scoped gossip validation.
@@ -10,10 +12,16 @@ pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration = Duration::from_millis(500);
 pub const BASIS_POINTS: u64 = 10_000;
 pub const ATTESTATION_DUE_BPS: u64 = 3333;
 pub const ATTESTATION_DUE_BPS_GLOAS: u64 = 2500;
+pub const AGGREGATE_DUE_BPS: u64 = 6667;
+pub const AGGREGATE_DUE_BPS_GLOAS: u64 = 5000;
 pub const PAYLOAD_ATTESTATION_DUE_BPS: u64 = 7500;
 
 pub fn attestation_due_bps(is_gloas: bool) -> u64 {
     if is_gloas { ATTESTATION_DUE_BPS_GLOAS } else { ATTESTATION_DUE_BPS }
+}
+
+pub fn aggregate_due_bps(is_gloas: bool) -> u64 {
+    if is_gloas { AGGREGATE_DUE_BPS_GLOAS } else { AGGREGATE_DUE_BPS }
 }
 
 // slot/24 before next slot = 500ms on mainnet.
@@ -144,6 +152,10 @@ impl SlotTicker {
         self.anchor_genesis_ms.saturating_add(self.anchor.elapsed().as_millis() as u64)
     }
 
+    pub fn since_genesis(&self) -> Nanos {
+        Nanos::from_millis(self.millis_since_genesis())
+    }
+
     pub fn slot_time_elapsed(&self) -> Duration {
         Duration::from_millis(self.millis_since_genesis() % self.slot_ms)
     }
@@ -201,6 +213,17 @@ impl SlotTicker {
         let wall = self.current_slot();
         let next = wall.saturating_add(1);
         if self.is_current_slot_with_disparity(next, disparity) { next } else { wall }
+    }
+
+    /// Time since genesis at which `slot` starts.
+    pub fn slot_start(&self, slot: Slot) -> Nanos {
+        Nanos::from_millis(slot * self.slot_ms)
+    }
+
+    /// Time since genesis at which `slot`'s aggregates are due.
+    pub fn aggregate_due(&self, slot: Slot) -> Nanos {
+        let due_ms = self.slot_ms * aggregate_due_bps(slot >= self.gloas_fork_slot) / BASIS_POINTS;
+        self.slot_start(slot) + Nanos::from_millis(due_ms)
     }
 
     pub fn is_before_attesting_interval(&self, is_gloas: bool) -> bool {
@@ -282,6 +305,34 @@ mod tests {
         assert!(matches!(t.tick(), TickEvent::SlotStart(1)));
         // Next phase (AnnouncePayload at 4s) is in the future.
         assert!(t.tick() == TickEvent::None);
+    }
+
+    #[test]
+    fn aggregate_due_follows_the_fork_of_the_slot() {
+        let gloas_epoch = 2;
+        let ticker = SlotTicker::new(
+            genesis_secs_ago(20),
+            &spec(12_000, gloas_epoch),
+            Duration::from_secs(4),
+        );
+        let gloas_slot = ticker.gloas_fork_slot;
+        let fulu = gloas_slot - 1;
+        assert_eq!(ticker.aggregate_due(fulu), Nanos::from_millis(fulu * 12_000 + 8_000));
+        assert_eq!(
+            ticker.aggregate_due(gloas_slot),
+            Nanos::from_millis(gloas_slot * 12_000 + 6_000)
+        );
+    }
+
+    #[test]
+    fn a_slot_starts_after_the_aggregates_of_the_one_before_are_due() {
+        let ticker =
+            SlotTicker::new(genesis_secs_ago(20), &spec(12_000, 2), Duration::from_secs(4));
+        let gloas_slot = ticker.gloas_fork_slot;
+        assert_eq!(ticker.slot_start(gloas_slot), Nanos::from_millis(gloas_slot * 12_000));
+        for slot in [gloas_slot, gloas_slot + 1] {
+            assert!(ticker.slot_start(slot) > ticker.aggregate_due(slot - 1), "slot {slot}");
+        }
     }
 
     #[test]
