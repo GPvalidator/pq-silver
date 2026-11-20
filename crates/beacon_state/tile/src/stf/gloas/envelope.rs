@@ -5,27 +5,35 @@ use flux_profiler::timed;
 use silver_beacon_state_data::{
     BUILDER_INDEX_SELF_BUILD, SpecConfig, StateReadView, Version,
     bls::{self, DOMAIN_BEACON_BUILDER},
+    pq::xmss_pubkey,
+    xmss::SignatureCheck,
 };
 use silver_common::{
-    ssz_hash_gloas::ExecutionRequestsView,
+    SignedBlockLayout,
     ssz_view::{
         EXECUTION_PAYLOAD_FIXED_GLOAS, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
-        MAX_WITHDRAWALS_PER_PAYLOAD, SignedExecutionPayloadEnvelopeView, WITHDRAWAL_SIZE,
-        WithdrawalView,
+        MAX_WITHDRAWALS_PER_PAYLOAD, SignedExecutionPayloadEnvelopePqView,
+        SignedExecutionPayloadEnvelopeView, WITHDRAWAL_SIZE, WithdrawalView,
     },
 };
 
+use super::parent_payload::RequestsLayout;
 use crate::error::EnvelopeError as E;
 
+/// `layout` is the envelope's block's: it sets the signature scheme and the
+/// execution requests type. `verify_xmss` is false only where XMSS is stubbed.
 pub fn verify_execution_payload_envelope(
     rv: &StateReadView,
     cfg: &SpecConfig,
+    layout: SignedBlockLayout,
     signed: &[u8],
+    verify_xmss: bool,
 ) -> Result<(), E> {
-    if !SignedExecutionPayloadEnvelopeView::check_canonical(signed) {
+    if envelope_layout(signed) != Some(layout) {
         return Err(E::Malformed);
     }
-    let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+    let is_pq = layout == SignedBlockLayout::Pq;
+    let envelope = layout.envelope_message(signed).ok_or(E::Malformed)?;
     let payload = ExecutionPayloadEnvelopeView::payload(envelope);
     let (wd_off, bal_off) = withdrawal_bounds(payload)?;
 
@@ -54,10 +62,11 @@ pub fn verify_execution_payload_envelope(
         return Err(E::BidMismatch { field: "block_hash" });
     }
     let requests = ExecutionPayloadEnvelopeView::execution_requests(envelope);
-    if ExecutionRequestsView::hash_tree_root(requests) != bid.execution_requests_root {
+    let requests_layout = RequestsLayout::for_fork(is_pq);
+    if requests_layout.hash_tree_root(requests) != bid.execution_requests_root {
         return Err(E::BidMismatch { field: "execution_requests_root" });
     }
-    ExecutionRequestsView::check_counts(requests)?;
+    requests_layout.check_counts(requests)?;
 
     if ExecutionPayloadView::slot_number(payload) != state.slot {
         return Err(E::PayloadMismatch { field: "slot_number" });
@@ -75,28 +84,44 @@ pub fn verify_execution_payload_envelope(
         return Err(E::TooManyWithdrawals { count, max: MAX_WITHDRAWALS_PER_PAYLOAD });
     }
 
+    if is_pq && !verify_xmss {
+        return Ok(());
+    }
     let fork_version = rv.epoch.fork_version_at(rv.slot.current_epoch());
-    verify_envelope_signature(
-        rv,
-        signed,
-        fork_version,
-        Some(state.latest_block_header.proposer_index),
-    )
+    let proposer_index = Some(state.latest_block_header.proposer_index);
+    verify_envelope_signature(rv, layout, signed, fork_version, proposer_index)
+}
+
+/// The layout `signed` is a canonical envelope of. The first offset tells the
+/// signature schemes apart.
+pub fn envelope_layout(signed: &[u8]) -> Option<SignedBlockLayout> {
+    if SignedExecutionPayloadEnvelopePqView::check_canonical(signed) {
+        return Some(SignedBlockLayout::Pq);
+    }
+    SignedExecutionPayloadEnvelopeView::check_canonical(signed).then_some(SignedBlockLayout::Gloas)
+}
+
+/// The message of an envelope `verify_execution_payload_envelope` accepted.
+/// The first offset tells the signature schemes apart.
+fn verified_message(signed: &[u8]) -> &[u8] {
+    if SignedExecutionPayloadEnvelopePqView::check_size(signed) {
+        SignedExecutionPayloadEnvelopePqView::message(signed)
+    } else {
+        SignedExecutionPayloadEnvelopeView::message(signed)
+    }
 }
 
 /// Only for an envelope `verify_execution_payload_envelope` accepted, which
 /// bounds and roots its requests.
 pub fn envelope_execution_requests(signed: &[u8]) -> &[u8] {
-    let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
-    ExecutionPayloadEnvelopeView::execution_requests(envelope)
+    ExecutionPayloadEnvelopeView::execution_requests(verified_message(signed))
 }
 
 /// `process_execution_payload`'s `payload.withdrawals ==
 /// state.payload_expected_withdrawals`: a gossip-valid envelope that fails it
 /// is relayed but never becomes this node's verified payload.
 pub fn envelope_withdrawals_match_expected(rv: &StateReadView, signed: &[u8]) -> bool {
-    let payload =
-        ExecutionPayloadEnvelopeView::payload(SignedExecutionPayloadEnvelopeView::message(signed));
+    let payload = ExecutionPayloadEnvelopeView::payload(verified_message(signed));
     payload_withdrawals_match_expected(rv, payload)
 }
 
@@ -131,30 +156,42 @@ fn withdrawal_bounds(payload: &[u8]) -> Result<(usize, usize), E> {
 #[timed]
 pub fn verify_envelope_signature(
     rv: &StateReadView,
+    layout: SignedBlockLayout,
     signed: &[u8],
     fork_version: Version,
     proposer_index: Option<u64>,
 ) -> Result<(), E> {
-    let envelope = SignedExecutionPayloadEnvelopeView::message(signed);
+    let envelope = layout.envelope_message(signed).ok_or(E::Malformed)?;
     let builder_index = ExecutionPayloadEnvelopeView::builder_index(envelope);
-    let message_root = ExecutionPayloadEnvelopeView::hash_tree_root(envelope);
+    let out_of_range = || E::BuilderOutOfRange { index: builder_index };
+    let self_built = builder_index == BUILDER_INDEX_SELF_BUILD;
+    let proposer = proposer_index
+        .map(|index| index as usize)
+        .filter(|&index| index < rv.validators.count())
+        .ok_or_else(out_of_range);
+    let builder = || rv.builders.get(builder_index as usize).ok_or_else(out_of_range);
     let domain =
         bls::compute_domain(DOMAIN_BEACON_BUILDER, fork_version, &rv.imm.genesis_validators_root);
-    let signing_root = bls::compute_signing_root(&message_root, &domain);
-    let sig = SignedExecutionPayloadEnvelopeView::signature(signed);
 
-    let valid = if builder_index == BUILDER_INDEX_SELF_BUILD {
-        let proposer = proposer_index
-            .map(|index| index as usize)
-            .filter(|&index| index < rv.validators.count())
-            .ok_or(E::BuilderOutOfRange { index: builder_index })?;
-        bls::verify_one(rv.validators.pubkey_decompressed(proposer), sig, &signing_root)
+    let valid = if layout == SignedBlockLayout::Pq {
+        let pubkey = if self_built {
+            *rv.validator_xmss_pubkey(proposer?).ok_or_else(out_of_range)?
+        } else {
+            *xmss_pubkey(&builder()?.pubkey)
+        };
+        let slot =
+            ExecutionPayloadView::slot_number(ExecutionPayloadEnvelopeView::payload(envelope));
+        SignatureCheck::execution_payload_envelope(signed, slot, &pubkey, &domain)
+            .is_some_and(|check| check.verify())
     } else {
-        let builder = rv
-            .builders
-            .get(builder_index as usize)
-            .ok_or(E::BuilderOutOfRange { index: builder_index })?;
-        bls::verify_one_compressed(&builder.pubkey, sig, &signing_root)
+        let message_root = ExecutionPayloadEnvelopeView::hash_tree_root(envelope);
+        let signing_root = bls::compute_signing_root(&message_root, &domain);
+        let sig = SignedExecutionPayloadEnvelopeView::signature(signed);
+        if self_built {
+            bls::verify_one(rv.validators.pubkey_decompressed(proposer?), sig, &signing_root)
+        } else {
+            bls::verify_one_compressed(&builder()?.pubkey, sig, &signing_root)
+        }
     };
     if !valid {
         return Err(E::BadSignature);
