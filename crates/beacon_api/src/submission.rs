@@ -37,6 +37,50 @@ pub(crate) fn post_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
     resp.fail_forged();
 }
 
+/// For endpoints whose SSZ body is a list of fixed-size containers, each
+/// published on `topic` as sent. `topic` checks each one's encoding.
+pub(crate) fn post_ssz_submission(
+    req: &Request<'_>,
+    ctx: &ApiCtx,
+    resp: &mut Response<'_>,
+    topic: GossipTopic,
+    entry_len: usize,
+) {
+    debug_assert!(req.body_is_ssz());
+    let body = req.body;
+    if body.is_empty() || !body.len().is_multiple_of(entry_len) {
+        return resp.error(400, "the body is not a list of whole entries");
+    }
+    let entries = body.chunks_exact(entry_len);
+    if entries.len() > MAX_SUBMISSION_ENTRIES {
+        return resp.error(400, "the body holds too many entries");
+    }
+    for (body_index, ssz) in entries.enumerate() {
+        submit(ctx, resp, body_index, SszEntry { ssz, topic });
+    }
+    resp.fail_forged();
+}
+
+struct SszEntry<'a> {
+    ssz: &'a [u8],
+    topic: GossipTopic,
+}
+
+impl SubmittedEntry for SszEntry<'_> {
+    fn accept(&self, _: &ApiCtx) -> Result<impl IntoIterator<Item = GossipTopic>, &'static str> {
+        self.topic.check_pq_signed_message(self.ssz)?;
+        Ok([self.topic])
+    }
+
+    fn ssz_len(&self) -> usize {
+        self.ssz.len()
+    }
+
+    fn encode(&self, out: &mut [u8]) {
+        out.copy_from_slice(self.ssz);
+    }
+}
+
 /// For endpoints whose body is one entry, not an array. It answers as entry 0
 /// of an array would; the indexed 400 still carries `ErrorMessage`'s fields.
 pub(crate) fn post_single_submission<'a, T: Deserialize<'a> + SubmittedEntry>(
@@ -114,7 +158,6 @@ pub(crate) struct SubmissionFailure {
 pub(crate) struct Submission {
     pub(crate) accepted: Vec<AcceptedEntry>,
     pub(crate) failures: Vec<SubmissionFailure>,
-    pub(crate) forward: Option<BuilderForward>,
     pub(crate) validation: BroadcastValidation,
     pub(crate) envelope: Option<EnvelopePublication>,
     pub(crate) integration: Integration,
@@ -259,14 +302,6 @@ impl RecentImports {
     }
 }
 
-/// A block for the builder whose bid it commits to, sent once every verdict
-/// accepts it.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct BuilderForward {
-    pub(crate) url: Box<str>,
-    pub(crate) ssz: TCacheRead,
-}
-
 impl Submission {
     /// `body_indices` ascend, as entries are accepted in body order.
     pub(crate) fn fail_accepted(&mut self, body_indices: &[usize], message: &'static str) {
@@ -317,17 +352,19 @@ pub(crate) fn failure_message(failure: LocalGossipFailure) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::time::Duration;
+    use std::{sync::LazyLock, time::Duration};
 
     use silver_beacon_state_data::{
-        BeaconState, BeaconStateOwner, EpochStateFinalized, Immutable, SLOTS_PER_EPOCH,
-        ShufflingId, SpecConfig, ValSeed,
+        BeaconState, BeaconStateOwner, EpochState, EpochStateFinalized, FinalizedValidators, Fork,
+        HashFormat, Immutable, SLOTS_PER_EPOCH, ShufflingId, SpecConfig, ValSeed, ValidatorsGroup,
         bls::{
             self,
             test_keys::{privkey, sign},
         },
+        pq::PQ_FORK_VERSION,
     };
-    use silver_common::SyncUpdate;
+    use silver_common::{SyncUpdate, ssz_view::XMSSSignature};
+    use silver_crypto_simd::xmss::{BottomTree, SecretKey};
 
     use super::*;
     use crate::ctx::{ApiCtx, test_ctx};
@@ -377,6 +414,68 @@ pub(crate) mod tests {
             ctx.read_state(|view| ShufflingId::from_state(&view, SLOT / SLOTS_PER_EPOCH).unwrap());
         ctx.shufflings.record(id, &[0u8; ACTIVE * size_of::<u32>()]);
         ctx
+    }
+
+    /// The key every validator of [`pq_ctx`] signs with, and its first bottom
+    /// tree, which holds the attestation leaves of the first epochs.
+    static XMSS_KEY: LazyLock<(SecretKey, BottomTree)> = LazyLock::new(|| {
+        let key = SecretKey::new(&[7; 32]);
+        let bottom = key.bottom_tree(0);
+        (key, bottom)
+    });
+
+    /// Enough that a body at the entry cap holds one attestation per validator.
+    pub(crate) const PQ_ACTIVE: usize = MAX_SUBMISSION_ENTRIES;
+
+    /// [`ctx`] on a chain that is PQ from genesis, whose `PQ_ACTIVE`
+    /// validators share one XMSS key.
+    pub(crate) fn pq_ctx() -> ApiCtx {
+        let spec = SpecConfig {
+            fulu_fork_epoch: 0,
+            gloas_fork_epoch: 0,
+            pq_fork_epoch: 0,
+            ..SpecConfig::mainnet()
+        };
+        let fork =
+            Fork { previous_version: PQ_FORK_VERSION, current_version: PQ_FORK_VERSION, epoch: 0 };
+        let epoch = EpochStateFinalized::from_state(EpochState { fork, ..Default::default() });
+        let seeds: Vec<_> =
+            (0..PQ_ACTIVE).map(|_| ValSeed { activation_epoch: 0, ..ValSeed::default() }).collect();
+        let mut state = BeaconState::for_test(epoch, &seeds, SLOT);
+        let mut record = XMSS_KEY.0.public_key().to_vec();
+        record.extend_from_slice(&[0; 32 + 32]);
+        record.extend_from_slice(&32_000_000_000u64.to_le_bytes());
+        record.push(0);
+        for epoch in [0, 0, u64::MAX, u64::MAX] {
+            record.extend_from_slice(&epoch.to_le_bytes());
+        }
+        state.validators = ValidatorsGroup::new(
+            FinalizedValidators::try_new_xmss(&record.repeat(PQ_ACTIVE)).unwrap(),
+            HashFormat::Progressive,
+        );
+        let mut owner = BeaconStateOwner::new(state);
+        let anchor = owner.roll_fresh();
+        owner.publish_state_id(anchor);
+
+        let mut ctx = test_ctx(&spec, owner.reader());
+        let id =
+            ctx.read_state(|view| ShufflingId::from_state(&view, SLOT / SLOTS_PER_EPOCH).unwrap());
+        ctx.shufflings.record(id, &[0u8; PQ_ACTIVE * size_of::<u32>()]);
+        ctx
+    }
+
+    /// The [`pq_ctx`] key's signature at `leaf`.
+    pub(crate) fn xmss_signature(domain_type: u32, object_root: &B256, leaf: u64) -> XMSSSignature {
+        let genesis_validators_root = Immutable::default().genesis_validators_root;
+        let domain = bls::compute_domain(domain_type, PQ_FORK_VERSION, &genesis_validators_root);
+        let signing_root = bls::compute_signing_root(object_root, &domain);
+        let (key, first_bottom) = &*XMSS_KEY;
+        let leaf = leaf as u32;
+        if leaf >> 16 == 0 {
+            key.sign(first_bottom, &signing_root, leaf)
+        } else {
+            key.sign(&key.bottom_tree(leaf >> 16), &signing_root, leaf)
+        }
     }
 
     /// How many committees the posted active set shuffles into, which bounds
