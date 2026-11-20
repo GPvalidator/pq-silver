@@ -1,4 +1,7 @@
-use std::fmt::{self, Display};
+use std::{
+    fmt::{self, Display},
+    ops::Range,
+};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
@@ -32,8 +35,9 @@ use silver_common::{
     },
 };
 use silver_ssz::ssz_view::{
-    PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
-    SignedExecutionPayloadBidView, SingleAttestationPqView, XMSSPubkey,
+    PAYLOAD_ATTESTATION_MESSAGE_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedAggregateAndProofPqView,
+    SignedExecutionPayloadBidPqView, SignedExecutionPayloadBidView, SingleAttestationPqView,
+    XMSSPubkey,
 };
 
 use super::{
@@ -41,9 +45,11 @@ use super::{
     attestation_pool::{InsertOutcome, Participants},
     block::lookahead_proposer,
     fork_data_roots::ForkDataRoots,
+    gossip_proofs::{AggregateAwaitingProof, AwaitingProofs, GossipAwaitingProof},
     held_blocks::BlockSourceMsg,
+    leanvm_verifier::ProofVerdict,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
-    pq_aggregation::VerifiedVote,
+    pq_aggregation::{VerifiedVote, claim},
     seen_aggregates::Coverage,
     seen_proposer_preferences::ProposerPreferences,
     shuffling_cache::ShufflingRequest,
@@ -1594,26 +1600,23 @@ impl BeaconStateTile {
             return self.slot_window_miss(parsed.agg_slot);
         }
 
-        self.seen_aggregators.rotate_to(self.seen_window_epoch());
-        if self.seen_aggregators.contains(parsed.att_epoch, parsed.aggregator_index) {
-            return Feedback::AlreadySeen;
-        }
-
         if parsed.committee_bits.count_ones() != 1 {
             return Feedback::reject("aggregate committee bits");
         }
         let committee_index = parsed.committee_bits.trailing_zeros() as usize;
 
         let data_root = self.attestation_root_memo.data_root(parsed.agg_data.as_bytes());
-        let coverage = self.seen_aggregates.coverage(
+        let coverage = match self.unseen_aggregate_coverage(
             parsed.agg_slot,
+            parsed.att_epoch,
             committee_index as u64,
+            parsed.aggregator_index,
             data_root,
             parsed.aggregation_bits,
-        );
-        if coverage == Coverage::BySuperset {
-            return Feedback::AlreadySeen;
-        }
+        ) {
+            Ok(coverage) => coverage,
+            Err(feedback) => return feedback,
+        };
 
         let canon_id = self.epoch_start_state(self.canonical_state_id(), parsed.agg_slot);
         let view = self.state.read_view(canon_id);
@@ -2063,6 +2066,25 @@ impl BeaconStateTile {
         self.ticker.latest_slot_with_disparity(MAXIMUM_GOSSIP_CLOCK_DISPARITY) / SLOTS_PER_EPOCH
     }
 
+    fn unseen_aggregate_coverage(
+        &mut self,
+        slot: Slot,
+        target_epoch: Epoch,
+        committee_index: u64,
+        aggregator_index: usize,
+        data_root: B256,
+        bits: &[u8],
+    ) -> Result<Coverage, Feedback> {
+        self.seen_aggregators.rotate_to(self.seen_window_epoch());
+        if self.seen_aggregators.contains(target_epoch, aggregator_index) {
+            return Err(Feedback::AlreadySeen);
+        }
+        match self.seen_aggregates.coverage(slot, committee_index, data_root, bits) {
+            Coverage::BySuperset => Err(Feedback::AlreadySeen),
+            coverage => Ok(coverage),
+        }
+    }
+
     /// The attested block's fork-choice index; `None` while it is unknown.
     fn validate_attestation_target(
         &self,
@@ -2366,11 +2388,17 @@ impl BeaconStateTile {
         Ok(())
     }
 
-    fn handle_pq_gossip(&mut self, m: &NewGossipMsg, data: &[u8]) -> Feedback {
+    fn handle_pq_gossip(
+        &mut self,
+        m: &NewGossipMsg,
+        pin: &TRead,
+        data: &[u8],
+        producers: &mut Producers,
+    ) -> Option<Feedback> {
         if let Err(feedback) = self.precheck_pq_gossip(m.topic, data) {
-            return feedback;
+            return Some(feedback);
         }
-        match m.topic {
+        let feedback = match m.topic {
             GossipTopic::ProposerPreferences => self.handle_proposer_preferences(
                 data,
                 ForkName::Pq,
@@ -2382,8 +2410,280 @@ impl BeaconStateTile {
             GossipTopic::ProposerSlashing => {
                 self.handle_pq_proposer_slashing(data.try_into().expect("checked PQ slashing size"))
             }
+            GossipTopic::BeaconAggregateAndProof => {
+                let (request_id, aggregate) = match self.send_pq_aggregate_proof(data, producers) {
+                    Ok(sent) => sent,
+                    Err(feedback) => return Some(feedback),
+                };
+                let gossip = GossipAwaitingProof::Aggregate(aggregate);
+                let slot = self.ticker.current_slot();
+                self.gossip_proofs.park(*m, pin.clone(), gossip, slot, request_id..request_id + 1);
+                return None;
+            }
+            GossipTopic::AttesterSlashing => {
+                let requests = match self.send_pq_attester_slashing_proofs(data, producers) {
+                    Ok(requests) => requests,
+                    Err(feedback) => return Some(feedback),
+                };
+                let gossip = GossipAwaitingProof::AttesterSlashing;
+                let slot = self.ticker.current_slot();
+                self.gossip_proofs.park(*m, pin.clone(), gossip, slot, requests);
+                return None;
+            }
             _ => Feedback::Ignore,
+        };
+        Some(feedback)
+    }
+
+    fn aggregate_state(&mut self, slot: Slot) -> StateId {
+        let head = self.canonical_state_id();
+        let head_epoch = self.slot_state_at(head).slot / SLOTS_PER_EPOCH;
+        if head_epoch + MIN_SEED_LOOKAHEAD < slot / SLOTS_PER_EPOCH {
+            self.epoch_start_state(head, slot)
+        } else {
+            head
         }
+    }
+
+    fn send_pq_aggregate_proof(
+        &mut self,
+        signed: &[u8],
+        producers: &mut Producers,
+    ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
+        let (state_id, aggregate) = self.check_pq_aggregate(signed)?;
+        self.verify_pq_aggregator(signed, state_id, &aggregate)?;
+
+        let data = SignedAggregateAndProofPqView::agg_data(signed);
+        let view = self.state.read_view(state_id);
+        let domain = Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data);
+        let (_, message) = self.attestation_root_memo.roots(data.as_bytes(), &domain);
+        let claims = aggregate.attesters.iter().map(|&attester| {
+            claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
+        });
+        let proof = SignedAggregateAndProofPqView::proof(signed);
+        let request_id = self
+            .leanvm_verifier
+            .send(claims, proof, &mut self.events_producer, producers)
+            .ok_or(Feedback::Ignore)?;
+        Ok((request_id, aggregate))
+    }
+
+    fn check_pq_aggregate(
+        &mut self,
+        signed: &[u8],
+    ) -> Result<(StateId, AggregateAwaitingProof), Feedback> {
+        let data = SignedAggregateAndProofPqView::agg_data(signed);
+        let slot = data.slot();
+        let target_epoch = data.target_epoch();
+        if !self.spec.is_pq_at_slot(slot) {
+            return Err(Feedback::reject("XMSS aggregate before the PQ fork"));
+        }
+        if target_epoch != slot / SLOTS_PER_EPOCH {
+            return Err(Feedback::reject("aggregate target epoch mismatch"));
+        }
+        if !self.attestation_slot_is_open(slot) {
+            return Err(self.slot_window_miss(slot));
+        }
+
+        let committee_bits =
+            u16::from_le_bytes(*SignedAggregateAndProofPqView::agg_committee_bits(signed));
+        let committee_index = committee_bits.trailing_zeros() as usize;
+        let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
+        let data_root = self.attestation_root_memo.data_root(data.as_bytes());
+        let aggregator_index = SignedAggregateAndProofPqView::aggregator_index(signed) as usize;
+        self.unseen_aggregate_coverage(
+            slot,
+            target_epoch,
+            committee_index as u64,
+            aggregator_index,
+            data_root,
+            bits,
+        )?;
+        if self.gossip_proofs.is_full() ||
+            self.gossip_proofs.awaits_aggregator(target_epoch, aggregator_index)
+        {
+            return Err(Feedback::Ignore);
+        }
+
+        let state_id = self.aggregate_state(slot);
+        let view = self.state.read_view(state_id);
+        let count = view.validators.count();
+        if aggregator_index >= count {
+            return Err(Feedback::reject("aggregator index out of range"));
+        }
+        let Some(request) = ShufflingRequest::new(&view, target_epoch) else {
+            return Err(Feedback::Ignore);
+        };
+        let AttestedBlock::Ready { payload_present } =
+            self.check_attested_block(data, request.id())?
+        else {
+            return Err(Feedback::Ignore);
+        };
+
+        let shuffling = self.shuffling_cache.get(request);
+        if committee_index >= shuffling.committees_per_slot {
+            return Err(Feedback::reject("aggregate committee index out of range"));
+        }
+        if merkle::bitlist_len(bits) != shuffling.committee(slot, committee_index).len() {
+            return Err(Feedback::reject("aggregate bits do not match committee size"));
+        }
+        let mut attesters = Vec::new();
+        let aggregate = SignedAggregateAndProofPqView::aggregate(signed);
+        if stf::AttestedCommittees::new(aggregate, true, &shuffling)
+            .and_then(|committees| committees.attesters_into(count, &mut attesters))
+            .is_err() ||
+            attesters.is_empty()
+        {
+            return Err(Feedback::reject("aggregate has no attesters"));
+        }
+
+        Ok((state_id, AggregateAwaitingProof {
+            target: stf::VoteTarget {
+                block_root: *data.beacon_block_root(),
+                target_epoch,
+                attestation_slot: slot,
+                payload_present,
+            },
+            attesters,
+            committee_index: committee_index as u64,
+            data_root,
+            aggregator_index,
+        }))
+    }
+
+    fn verify_pq_aggregator(
+        &mut self,
+        signed: &[u8],
+        state_id: StateId,
+        aggregate: &AggregateAwaitingProof,
+    ) -> Result<(), Feedback> {
+        let target = aggregate.target;
+        let view = self.state.read_view(state_id);
+        match view.is_aggregator(
+            target.attestation_slot,
+            aggregate.committee_index as usize,
+            aggregate.aggregator_index as u64,
+        ) {
+            Some(true) => {}
+            Some(false) => return Err(Feedback::reject("aggregator not selected")),
+            None => return Err(Feedback::Ignore),
+        }
+        let Some(pubkey) = view.validator_xmss_pubkey(aggregate.aggregator_index) else {
+            return Err(Feedback::Ignore);
+        };
+        let domain = bls::domain_from_fork_data(
+            bls::DOMAIN_AGGREGATE_AND_PROOF,
+            &self.fork_data_roots.root(
+                self.spec.fork_version_at(target.target_epoch),
+                &view.imm.genesis_validators_root,
+            ),
+        );
+        if !SignatureCheck::aggregate_and_proof(signed, pubkey, &domain).verify() {
+            return Err(Feedback::reject("aggregate bad signature"));
+        }
+        Ok(())
+    }
+
+    fn send_pq_attester_slashing_proofs(
+        &mut self,
+        slashing: &[u8],
+        producers: &mut Producers,
+    ) -> Result<Range<u64>, Feedback> {
+        if self.gossip_proofs.is_full() {
+            return Err(Feedback::Ignore);
+        }
+        let state_id = self.canonical_state_id();
+        let view = self.state.read_view(state_id);
+        if !view.is_pq() {
+            return Err(Feedback::Ignore);
+        }
+        let seen = |vi| self.seen_attester_slashed.contains(vi);
+        let claims = &mut self.stf_scratch.stark;
+        match stf::validate_pq_attester_slashing_for_gossip(&view, slashing, seen, claims) {
+            Ok(true) => {}
+            Ok(false) => return Err(Feedback::Ignore),
+            Err(e) => {
+                silver_log::debug!(error = %e, "attester_slashing gossip rejected");
+                return Err(Feedback::reject("attester slashing invalid"));
+            }
+        }
+        self.send_stark_proofs(slashing, state_id, producers).ok_or(Feedback::Ignore)
+    }
+
+    pub(super) fn settle_gossip_proofs(
+        &mut self,
+        awaiting: AwaitingProofs,
+        verdict: ProofVerdict,
+        producers: &mut Producers,
+    ) {
+        let AwaitingProofs { msg, pin, gossip, .. } = awaiting;
+        let Some(data) = pin.buffer().ok().map(|(data, _)| data) else {
+            return Self::local_verdict(&msg, Feedback::Ignore, producers);
+        };
+        let feedback = match (verdict, gossip) {
+            (ProofVerdict::Unanswered, _) => Feedback::Ignore,
+            (ProofVerdict::Invalid, _) => Feedback::reject("STARK proof invalid"),
+            (ProofVerdict::Valid, GossipAwaitingProof::Aggregate(aggregate)) => {
+                self.commit_pq_aggregate(data, &aggregate)
+            }
+            (ProofVerdict::Valid, GossipAwaitingProof::AttesterSlashing) => {
+                self.commit_pq_attester_slashing(data)
+            }
+        };
+        match feedback {
+            Feedback::Accept => {
+                Self::relay_gossip(&msg, None, producers);
+                self.publish_status(producers);
+            }
+            Feedback::Reject { reason, .. } => self.reject_gossip(&msg, data, reason, producers),
+            feedback => Self::local_verdict(&msg, feedback, producers),
+        }
+    }
+
+    fn commit_pq_aggregate(
+        &mut self,
+        signed: &[u8],
+        aggregate: &AggregateAwaitingProof,
+    ) -> Feedback {
+        let target = aggregate.target;
+        let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
+        let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
+        let coverage = match self.unseen_aggregate_coverage(
+            slot,
+            target.target_epoch,
+            committee_index,
+            aggregate.aggregator_index,
+            aggregate.data_root,
+            bits,
+        ) {
+            Ok(coverage) => coverage,
+            Err(feedback) => return feedback,
+        };
+        self.seen_aggregates.record(slot, committee_index, aggregate.data_root, bits);
+        self.seen_aggregators.mark(target.target_epoch, aggregate.aggregator_index);
+
+        if coverage != Coverage::ByUnion {
+            self.fork_choice.record_or_defer_votes(
+                target,
+                &aggregate.attesters,
+                self.head_validator_count(),
+                self.ticker.current_slot(),
+            );
+        }
+        Feedback::Accept
+    }
+
+    fn commit_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {
+        let validator_count = self.head_validator_count();
+        let equivocators = &mut self.stf_scratch.active;
+        if stf::attester_slashing_equivocators(slashing, validator_count, equivocators).is_err() {
+            return Feedback::Ignore;
+        }
+        for &index in equivocators.iter() {
+            self.fork_choice.mark_equivocating(index as usize);
+            self.seen_attester_slashed.mark(index as usize);
+        }
+        Feedback::Accept
     }
 
     fn handle_pq_proposer_slashing(
@@ -2443,7 +2743,10 @@ impl BeaconStateTile {
 
         let feedback = match m.topic {
             _ if m.domain.format() == ForkName::Pq && m.topic != GossipTopic::BeaconBlock => {
-                self.handle_pq_gossip(&m, data)
+                match self.handle_pq_gossip(&m, &acquired, data, producers) {
+                    Some(feedback) => feedback,
+                    None => return true,
+                }
             }
             GossipTopic::BeaconBlock if self.sync_target.is_syncing() => {
                 match self.parse_and_verify_block(data, pre_verified) {
