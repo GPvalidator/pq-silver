@@ -4,7 +4,8 @@ use flux::{Timer, spine::SpineProducers};
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheRead, TCacheReader, TProducer,
+    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
+    TProducer,
     ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, SingleAttestationPqView},
     ticker::SlotTicker,
 };
@@ -14,6 +15,7 @@ use super::{
     claims::Vote,
     leaf::{LeafAggregation, LeafKey, ProvedAggregate},
     merge::MergeAggregation,
+    rolling::{POOL_SLOTS, Rolling, RollingJob, claims_of},
     strategy::Batch,
 };
 use crate::tile::Producers;
@@ -33,6 +35,12 @@ impl AggregationKey {
     }
 }
 
+/// What one request to the leanVM sidecar is for.
+enum Job {
+    Batch(AggregationKey, Batch),
+    Rolling(RollingJob),
+}
+
 /// The leanVM sidecar as the aggregator sees it: one request at a time, and
 /// none while it is down.
 #[derive(Default)]
@@ -42,8 +50,7 @@ enum LeanVm {
     Idle,
     Busy {
         request_id: u64,
-        key: AggregationKey,
-        batch: Batch,
+        job: Job,
         sent: Nanos,
     },
 }
@@ -59,21 +66,21 @@ impl LeanVm {
         }
     }
 
-    /// The batch that was in flight, now lost.
-    fn down(&mut self) -> Option<(AggregationKey, Batch)> {
+    /// The job that was in flight, now lost.
+    fn down(&mut self) -> Option<Job> {
         match mem::take(self) {
-            Self::Busy { key, batch, .. } => Some((key, batch)),
+            Self::Busy { job, .. } => Some(job),
             Self::Down | Self::Idle => None,
         }
     }
 
-    /// Becomes idle if `request_id` is in flight, handing back its batch and
+    /// Becomes idle if `request_id` is in flight, handing back its job and
     /// when it went out.
-    fn take_answered(&mut self, request_id: u64) -> Option<(AggregationKey, Batch, Nanos)> {
+    fn take_answered(&mut self, request_id: u64) -> Option<(Job, Nanos)> {
         match mem::take(self) {
-            Self::Busy { request_id: id, key, batch, sent } if id == request_id => {
+            Self::Busy { request_id: id, job, sent } if id == request_id => {
                 *self = Self::Idle;
-                Some((key, batch, sent))
+                Some((job, sent))
             }
             other => {
                 *self = other;
@@ -87,13 +94,16 @@ impl LeanVm {
 /// across all aggregations. Events only change state; `send_next` sends.
 pub struct PqAggregator {
     leaves: FxHashMap<LeafKey, LeafAggregation>,
-    merges: FxHashMap<Slot, MergeAggregation>,
     /// An event changed state since `send_next` last found nothing to send.
     changed: bool,
+    /// By attestation slot.
+    merges: FxHashMap<Slot, MergeAggregation>,
+    rolling: Rolling,
     leanvm: LeanVm,
     next_request_id: u64,
     leaf_round_trip: Timer,
     merge_round_trip: Timer,
+    rolling_round_trip: Timer,
 }
 
 impl Default for PqAggregator {
@@ -101,11 +111,13 @@ impl Default for PqAggregator {
         Self {
             leaves: FxHashMap::default(),
             merges: FxHashMap::default(),
+            rolling: Rolling::default(),
             changed: false,
             leanvm: LeanVm::default(),
             next_request_id: 0,
             leaf_round_trip: Timer::new("silver", "leanvm_prove"),
             merge_round_trip: Timer::new("silver", "leanvm_merge"),
+            rolling_round_trip: Timer::new("silver", "leanvm_roll"),
         }
     }
 }
@@ -145,12 +157,14 @@ impl PqAggregator {
         self.changed = true;
     }
 
-    /// `aggregate` is verified, for the block of `slot`. A merge refuses it
-    /// once it holds too many committees.
-    pub fn add_aggregate(&mut self, slot: Slot, aggregate: Aggregate, ticker: &SlotTicker) {
-        let deadline = ticker.slot_start(slot);
-        if ticker.since_genesis() >= deadline {
-            silver_log::debug!(slot, "aggregate after the merge deadline");
+    /// `aggregate` is verified. It joins the merge of its attestation slot,
+    /// which ends when the next slot starts. A merge refuses it once it holds
+    /// too many committees.
+    pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
+        let slot = aggregate.group.slot;
+        let deadline = ticker.slot_start(slot + 1);
+        if ticker.since_genesis() >= deadline || !self.rolling.awaits(slot) {
+            silver_log::debug!(slot, "aggregate after its slot's merge ended");
             return;
         }
         let merge = self.merges.entry(slot).or_insert_with(|| MergeAggregation::new(deadline));
@@ -169,15 +183,16 @@ impl PqAggregator {
         if body.is_none() && acquired.is_some() {
             silver_log::error!(request_id = resp.request_id, "leanvm response unreadable");
         }
-        let Some((key, batch, sent)) = self.leanvm.take_answered(resp.request_id) else { return };
+        let Some((job, sent)) = self.leanvm.take_answered(resp.request_id) else { return };
         if body.is_some() {
-            let round_trip = match key {
-                AggregationKey::Leaf(_) => &mut self.leaf_round_trip,
-                AggregationKey::Merge(_) => &mut self.merge_round_trip,
+            let round_trip = match job {
+                Job::Batch(AggregationKey::Leaf(_), _) => &mut self.leaf_round_trip,
+                Job::Batch(AggregationKey::Merge(_), _) => &mut self.merge_round_trip,
+                Job::Rolling(_) => &mut self.rolling_round_trip,
             };
             round_trip.emit_latency_from_nanos(sent, Nanos::now());
         }
-        self.finish(key, batch, body.map(|(body, _)| body));
+        self.finish(job, body.map(|(body, _)| body));
         self.changed = true;
     }
 
@@ -186,17 +201,30 @@ impl PqAggregator {
     pub fn on_health(&mut self, health: LeanVmHealthEvent) {
         if health.ready {
             self.leanvm.up();
-        } else if let Some((key, batch)) = self.leanvm.down() {
-            self.finish(key, batch, None);
+        } else if let Some(job) = self.leanvm.down() {
+            self.finish(job, None);
         }
         self.changed = true;
     }
 
     /// Drops the aggregations of slots before `floor`. The request in flight
     /// for one still occupies the leanVM sidecar until its response arrives.
+    ///
+    /// Called as slot `floor + 1` starts, which ends the merge of slot
+    /// `floor`. The block of that slot may include the `POOL_SLOTS` slots up
+    /// to `floor - 1`. An ended merge stays until the rolling proof takes it.
     pub fn prune_before(&mut self, floor: Slot) {
         self.leaves.retain(|leaf, _| leaf.slot >= floor);
-        self.merges.retain(|&slot, _| slot >= floor);
+        self.rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
+        self.merges.retain(|&slot, _| self.rolling.awaits(slot));
+        self.changed = true;
+    }
+
+    /// A block included the votes of `validators` for attestation slot
+    /// `slot`: the rolling proof no longer needs them.
+    pub fn on_chain(&mut self, slot: Slot, validators: &[u32]) {
+        self.rolling.include_on_chain(slot, validators);
+        self.changed = true;
     }
 
     /// Sends a batch of the highest priority aggregation, if the leanVM
@@ -214,17 +242,57 @@ impl PqAggregator {
             return;
         }
         let now = ticker.since_genesis();
-        let Some(key) = self.highest_priority(now) else {
-            self.changed = false;
-            return;
+        let (job, body) = if let Some((job, body)) = self.next_rolling_request(ticker, tcache) {
+            // `None`: the tcache is full. The next loop retries.
+            let Some(body) = body else { return };
+            (Job::Rolling(job), body)
+        } else {
+            let Some(key) = self.highest_priority(now) else {
+                self.changed = false;
+                return;
+            };
+            // `None`: the tcache is full, or a strategy bug counted a failure.
+            // The next loop retries.
+            let Some((batch, body)) = self.write_request(key, now, tcache) else { return };
+            (Job::Batch(key, batch), body)
         };
-        // `None`: the tcache is full, or a strategy bug counted a failure. The
-        // next loop retries.
-        let Some((batch, body)) = self.write_request(key, now, tcache) else { return };
         let request_id = self.next_request_id;
         self.next_request_id += 1;
-        self.leanvm = LeanVm::Busy { request_id, key, batch, sent: Nanos::now() };
+        self.leanvm = LeanVm::Busy { request_id, job, sent: Nanos::now() };
         producers.produce(LeanVmReq { request_id, body });
+    }
+
+    /// The next change to the rolling proof that needs the leanVM sidecar,
+    /// with its request written to `tcache`, or `None` for a full tcache.
+    /// Changes that need no proof are made here. It goes ahead of every
+    /// batch: there are at most two a slot, and a proposal waits on them.
+    fn next_rolling_request(
+        &mut self,
+        ticker: &SlotTicker,
+        tcache: &mut TProducer,
+    ) -> Option<(RollingJob, Option<TCacheRead>)> {
+        let now = ticker.since_genesis();
+        loop {
+            if let Some(groups) = self.rolling.next_reduction() {
+                let kept = claims_of(&groups);
+                let request = self.rolling.reduce_request(&kept)?;
+                let body = tcache.write_with(request.len(), |out| request.write(out));
+                return Some((RollingJob::Reduce { groups }, body));
+            }
+            let ended = |slot: &Slot| now >= ticker.slot_start(slot + 1);
+            let slot = (self.merges.keys().copied())
+                .filter(|slot| ended(slot) && self.rolling.awaits(*slot))
+                .min()?;
+            let Some(taken) = self.merges.remove(&slot).and_then(|merge| merge.proved()) else {
+                continue;
+            };
+            let Some(request) = self.rolling.roll_request(&taken) else {
+                self.rolling.start_with(slot, taken);
+                continue;
+            };
+            let body = tcache.write_with(request.len(), |out| request.write(out));
+            return Some((RollingJob::Roll { slot, taken }, body));
+        }
     }
 
     pub fn aggregate(
@@ -236,12 +304,22 @@ impl PqAggregator {
         self.leaves.get(&LeafKey { slot, committee_index, data_root })?.proved(committee_index)
     }
 
+    /// The attestations and proof for the body of the block at `slot`.
     pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
-        self.merges.get(&slot)?.block_proof()
+        self.rolling.block_proof(slot)
     }
 
-    /// A pruned aggregation drops `batch`.
-    fn finish(&mut self, key: AggregationKey, batch: Batch, body: Option<&[u8]>) {
+    /// A pruned aggregation drops its batch.
+    fn finish(&mut self, job: Job, body: Option<&[u8]>) {
+        let (key, batch) = match job {
+            Job::Batch(key, batch) => (key, batch),
+            Job::Rolling(job) => {
+                if let Err(reason) = self.rolling.finish(job, body) {
+                    silver_log::warn!(reason, "rolling proof request failed");
+                }
+                return;
+            }
+        };
         let settled = match key {
             AggregationKey::Leaf(leaf) => (self.leaves.get_mut(&leaf))
                 .map(|leaf| (leaf.finish(batch, body), leaf.core.is_stopped())),

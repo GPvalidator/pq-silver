@@ -15,6 +15,7 @@ mod aggregator;
 mod claims;
 mod leaf;
 mod merge;
+mod rolling;
 mod strategy;
 #[cfg(test)]
 pub(super) mod test_util;

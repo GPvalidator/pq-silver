@@ -7785,7 +7785,7 @@ mod pq_aggregator {
 
     use super::*;
     use crate::tile::pq_aggregation::{
-        Aggregate, Claim, VerifiedVote, test_util::attestation, wire::AggregateResponse,
+        Aggregate, Claim, VerifiedVote, test_util::attestation_in, wire::AggregateResponse,
     };
 
     const SLOT: Slot = 40;
@@ -7860,10 +7860,20 @@ mod pq_aggregator {
             self.send_next();
         }
 
+        /// An aggregate of attestation slot `slot`.
         fn aggregate(&mut self, slot: Slot, claims: &[Claim]) {
-            let attestation = attestation(0, 0..claims.len());
-            let aggregate = Aggregate::new(claims.to_vec(), b"child".to_vec(), attestation);
-            self.tile.pq_aggregator.add_aggregate(slot, aggregate.unwrap(), &self.tile.ticker);
+            let attestation = attestation_in(slot, 0, 0..claims.len());
+            let attesters: Vec<u32> = (0..claims.len() as u32).collect();
+            let aggregate =
+                Aggregate::new(&attestation, &attesters, claims.to_vec(), b"child".to_vec());
+            self.tile.pq_aggregator.add_aggregate(aggregate.unwrap(), &self.tile.ticker);
+            self.send_next();
+        }
+
+        fn start_slot(&mut self, slot: Slot) {
+            let start_ms = self.tile.ticker.slot_start(slot).as_millis_u64();
+            self.tile.ticker.set_since_genesis_ms(start_ms);
+            self.tile.pq_aggregator.prune_before(slot - 1);
             self.send_next();
         }
 
@@ -7970,14 +7980,50 @@ mod pq_aggregator {
     fn an_aggregate_is_merged_into_the_block_proof() {
         let mut rig = Rig::new();
         rig.ready();
-        rig.aggregate(SLOT + 1, &[[1; 64], [2; 64]]);
+        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
         let request = rig.request();
-        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
-
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
-        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
-        assert_eq!(attestations, [attestation(0, 0..2)]);
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 2).is_none(), "the slot has not ended");
+
+        rig.start_slot(SLOT + 1);
+        assert!(rig.requests().is_empty(), "the first proof needs no roll");
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "too new to include");
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 2).unwrap();
+        assert_eq!(attestations, [attestation_in(SLOT, 0, 0..2)]);
         assert_eq!(proof, b"proof");
+    }
+
+    #[test]
+    fn each_slot_rolls_into_one_proof_and_on_chain_votes_are_proved_out() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
+        let request = rig.request();
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
+        rig.start_slot(SLOT + 1);
+        rig.aggregate(SLOT + 1, &[[3; 64]]);
+        let request = rig.request();
+        rig.respond(request.request_id, &[[3; 64]]);
+
+        rig.start_slot(SLOT + 2);
+        let roll = rig.request();
+        assert!([1, 2, 3].into_iter().all(|tag| rig.carries(&roll, tag)));
+        rig.respond(roll.request_id, &[[1; 64], [2; 64], [3; 64]]);
+        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        assert_eq!(attestations.len(), 2, "one per slot");
+
+        rig.tile.pq_aggregator.on_chain(SLOT, &[0]);
+        rig.send_next();
+        let reduce = rig.request();
+        rig.respond(reduce.request_id, &[[2; 64], [3; 64]]);
+        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
+        assert_eq!(attestations[0], attestation_in(SLOT, 0, [1]), "validator 0 is on chain");
+
+        rig.start_slot(SLOT + 6);
+        let expire = rig.request();
+        rig.respond(expire.request_id, &[[3; 64]]);
+        let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 6).unwrap();
+        assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])], "slot SLOT grew too old");
     }
 
     #[test]
@@ -8012,9 +8058,9 @@ mod pq_aggregator {
         rig.ready();
         rig.vote_on(ROOT_A, 1);
         let mut request = rig.request();
-        rig.aggregate(SLOT + 2, &[[10; 64]]);
+        rig.aggregate(SLOT + 1, &[[10; 64]]);
         rig.vote_in(SLOT + 1, ROOT_A, 4);
-        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.aggregate(SLOT, &[[9; 64]]);
         rig.vote_on(ROOT_B, 3);
         rig.vote_on(ROOT_A, 2);
         assert!(rig.requests().is_empty(), "the others wait");
@@ -8034,14 +8080,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn an_aggregate_at_its_block_slot_start_is_dropped() {
+    fn an_aggregate_after_its_slot_ended_is_dropped() {
         let mut rig = Rig::new();
         rig.ready();
         let start_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64();
         rig.tile.ticker.set_since_genesis_ms(start_ms);
-        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.aggregate(SLOT, &[[9; 64]]);
         rig.tile.ticker.set_since_genesis_ms(start_ms - 1);
-        rig.aggregate(SLOT + 1, &[[10; 64]]);
+        rig.aggregate(SLOT, &[[10; 64]]);
         let request = rig.request();
         assert!(rig.carries(&request, 10), "an earlier arrival would go first");
     }
@@ -8074,7 +8120,7 @@ mod pq_aggregator {
         let mut rig = Rig::new();
         rig.ready();
         let pin = rig.fill_tcache();
-        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.aggregate(SLOT, &[[9; 64]]);
         for _ in 0..5 {
             rig.send_next();
         }
@@ -8093,7 +8139,7 @@ mod pq_aggregator {
         rig.vote(1);
         let stale = rig.request();
         rig.tile.pq_aggregator.prune_before(SLOT + 1);
-        rig.aggregate(SLOT + 2, &[[9; 64]]);
+        rig.aggregate(SLOT + 1, &[[9; 64]]);
         assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
 
         rig.respond(stale.request_id, &[[1; 64]]);

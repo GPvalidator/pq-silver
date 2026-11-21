@@ -55,8 +55,9 @@ fn merge(children: impl IntoIterator<Item = Aggregate>) -> MergeAggregation {
 /// Claim `tag` sits at position `tag` of committee 0.
 fn child(tags: &[u16]) -> Aggregate {
     let claims = tags.iter().copied().map(claim).collect();
+    let attesters: Vec<u32> = tags.iter().map(|&tag| tag.into()).collect();
     let ssz = attestation(0, tags.iter().map(|&tag| tag as usize));
-    Aggregate::new(claims, b"child".to_vec(), ssz).unwrap()
+    Aggregate::new(&ssz, &attesters, claims, b"child".to_vec()).unwrap()
 }
 
 fn priority(leaf: &LeafAggregation) -> Priority {

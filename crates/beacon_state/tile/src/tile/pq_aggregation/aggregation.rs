@@ -133,7 +133,8 @@ impl Aggregation {
             .map(|best| (best.claims.as_slice(), best.proof.as_slice()))
             .collect();
         let log_inv_rate = batch.log_inv_rate();
-        let mut request = AggregateRequest { log_inv_rate, proofs, signatures: Vec::new() };
+        let mut request =
+            AggregateRequest { log_inv_rate, proofs, signatures: Vec::new(), output: None };
         for &index in batch.indices() {
             self.verified[index].add_to(&mut request);
         }

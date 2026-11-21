@@ -11,7 +11,7 @@ use silver_beacon_state_data::{
     SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
-    pq::{MIN_ATTESTATION_INCLUSION_DELAY_PQ, xmss_pubkey},
+    pq::xmss_pubkey,
     xmss::SignatureCheck,
 };
 use silver_common::{
@@ -2464,8 +2464,7 @@ impl BeaconStateTile {
     ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
         let (state_id, mut aggregate) = self.check_pq_aggregate(signed)?;
         self.verify_pq_aggregator(signed, state_id, &aggregate)?;
-        let block_slot = aggregate.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
-        let merges = self.proposes_locally(block_slot);
+        let merges = self.has_local_proposers();
 
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         let view = self.state.read_view(state_id);
@@ -2688,11 +2687,10 @@ impl BeaconStateTile {
             );
         }
         if let Some(claims) = aggregate.merge_claims {
-            let block_slot = slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
             let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
-            let attestation = SignedAggregateAndProofPqView::aggregate(signed).to_vec();
-            match Aggregate::new(claims, proof, attestation) {
-                Some(merged) => self.pq_aggregator.add_aggregate(block_slot, merged, &self.ticker),
+            let attestation = SignedAggregateAndProofPqView::aggregate(signed);
+            match Aggregate::new(attestation, &aggregate.attesters, claims, proof) {
+                Some(merged) => self.pq_aggregator.add_aggregate(merged, &self.ticker),
                 None => silver_log::error!(slot, "verified aggregate does not fit a merge"),
             }
         }
