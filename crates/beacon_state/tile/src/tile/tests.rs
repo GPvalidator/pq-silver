@@ -7980,6 +7980,22 @@ mod pq_aggregator {
     fn an_aggregate_is_merged_into_the_block_proof() {
         let mut rig = Rig::new();
         rig.ready();
+        rig.aggregate(SLOT - 1, &[[1; 64], [2; 64]]);
+        let request = rig.request();
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 1).is_none(), "no proof yet");
+
+        rig.respond(request.request_id, &[[1; 64], [2; 64]]);
+        assert!(rig.tile.pq_aggregator.block_proof(SLOT + 2).is_none(), "only the newest slot");
+        let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
+        assert_eq!(attestations, [attestation_in(SLOT - 1, 0, 0..2)]);
+        assert_eq!(proof, b"proof");
+    }
+
+    #[test]
+    fn a_rolling_proof_starts_with_the_first_ended_slot() {
+        let mut rig = Rig::new();
+        rig.tile.enable_pq_rolling_aggregate();
+        rig.ready();
         rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
         let request = rig.request();
         rig.respond(request.request_id, &[[1; 64], [2; 64]]);
@@ -7996,6 +8012,7 @@ mod pq_aggregator {
     #[test]
     fn each_slot_rolls_into_one_proof_and_on_chain_votes_are_proved_out() {
         let mut rig = Rig::new();
+        rig.tile.enable_pq_rolling_aggregate();
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
         let request = rig.request();
@@ -8058,9 +8075,9 @@ mod pq_aggregator {
         rig.ready();
         rig.vote_on(ROOT_A, 1);
         let mut request = rig.request();
-        rig.aggregate(SLOT + 1, &[[10; 64]]);
+        rig.aggregate(SLOT, &[[10; 64]]);
         rig.vote_in(SLOT + 1, ROOT_A, 4);
-        rig.aggregate(SLOT, &[[9; 64]]);
+        rig.aggregate(SLOT - 1, &[[9; 64]]);
         rig.vote_on(ROOT_B, 3);
         rig.vote_on(ROOT_A, 2);
         assert!(rig.requests().is_empty(), "the others wait");
@@ -8080,14 +8097,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn an_aggregate_after_its_slot_ended_is_dropped() {
+    fn an_aggregate_at_its_block_slot_start_is_dropped() {
         let mut rig = Rig::new();
         rig.ready();
         let start_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64();
         rig.tile.ticker.set_since_genesis_ms(start_ms);
-        rig.aggregate(SLOT, &[[9; 64]]);
+        rig.aggregate(SLOT - 1, &[[9; 64]]);
         rig.tile.ticker.set_since_genesis_ms(start_ms - 1);
-        rig.aggregate(SLOT, &[[10; 64]]);
+        rig.aggregate(SLOT - 1, &[[10; 64]]);
         let request = rig.request();
         assert!(rig.carries(&request, 10), "an earlier arrival would go first");
     }
@@ -8139,7 +8156,7 @@ mod pq_aggregator {
         rig.vote(1);
         let stale = rig.request();
         rig.tile.pq_aggregator.prune_before(SLOT + 1);
-        rig.aggregate(SLOT + 1, &[[9; 64]]);
+        rig.aggregate(SLOT, &[[9; 64]]);
         assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
 
         rig.respond(stale.request_id, &[[1; 64]]);

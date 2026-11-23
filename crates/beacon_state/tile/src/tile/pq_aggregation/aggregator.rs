@@ -2,7 +2,7 @@ use std::{cmp::Reverse, mem};
 
 use flux::{Timer, spine::SpineProducers};
 use rustc_hash::FxHashMap;
-use silver_beacon_state_data::{B256, Slot};
+use silver_beacon_state_data::{B256, Slot, pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ};
 use silver_common::{
     LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
     TProducer,
@@ -98,12 +98,15 @@ pub struct PqAggregator {
     changed: bool,
     /// By attestation slot.
     merges: FxHashMap<Slot, MergeAggregation>,
-    rolling: Rolling,
+    /// `None`: a block gets only the merge of the newest slot it may
+    /// include.
+    rolling: Option<Rolling>,
     leanvm: LeanVm,
     next_request_id: u64,
     leaf_round_trip: Timer,
     merge_round_trip: Timer,
-    rolling_round_trip: Timer,
+    roll_round_trip: Timer,
+    reduce_round_trip: Timer,
 }
 
 impl Default for PqAggregator {
@@ -111,18 +114,28 @@ impl Default for PqAggregator {
         Self {
             leaves: FxHashMap::default(),
             merges: FxHashMap::default(),
-            rolling: Rolling::default(),
+            rolling: None,
             changed: false,
             leanvm: LeanVm::default(),
             next_request_id: 0,
             leaf_round_trip: Timer::new("silver", "leanvm_prove"),
             merge_round_trip: Timer::new("silver", "leanvm_merge"),
-            rolling_round_trip: Timer::new("silver", "leanvm_roll"),
+            roll_round_trip: Timer::new("silver", "leanvm_roll"),
+            reduce_round_trip: Timer::new("silver", "leanvm_reduce"),
         }
     }
 }
 
 impl PqAggregator {
+    /// Keeps one proof of the pooled votes not yet on chain, across slots.
+    pub fn enable_rolling(&mut self) {
+        self.rolling = Some(Rolling::default());
+    }
+
+    pub fn is_rolling(&self) -> bool {
+        self.rolling.is_some()
+    }
+
     /// `last_position` is the last place a local aggregator of the vote's
     /// committee holds in its aggregation committee. Votes are taken until
     /// its cutoff and proved until its aggregate is due.
@@ -157,13 +170,17 @@ impl PqAggregator {
         self.changed = true;
     }
 
-    /// `aggregate` is verified. It joins the merge of its attestation slot,
-    /// which ends when the next slot starts. A merge refuses it once it holds
-    /// too many committees.
+    /// `aggregate` is verified. It joins the merge of its attestation slot.
+    /// That merge ends when the first block to include it is due, or with
+    /// the slot when the rolling proof takes it in. A merge refuses it once
+    /// it holds too many committees.
     pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
         let slot = aggregate.group.slot;
-        let deadline = ticker.slot_start(slot + 1);
-        if ticker.since_genesis() >= deadline || !self.rolling.awaits(slot) {
+        let (deadline, awaited) = match &self.rolling {
+            Some(rolling) => (ticker.slot_start(slot + 1), rolling.awaits(slot)),
+            None => (ticker.slot_start(slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ), true),
+        };
+        if ticker.since_genesis() >= deadline || !awaited {
             silver_log::debug!(slot, "aggregate after its slot's merge ended");
             return;
         }
@@ -188,7 +205,8 @@ impl PqAggregator {
             let round_trip = match job {
                 Job::Batch(AggregationKey::Leaf(_), _) => &mut self.leaf_round_trip,
                 Job::Batch(AggregationKey::Merge(_), _) => &mut self.merge_round_trip,
-                Job::Rolling(_) => &mut self.rolling_round_trip,
+                Job::Rolling(RollingJob::Roll { .. }) => &mut self.roll_round_trip,
+                Job::Rolling(RollingJob::Reduce { .. }) => &mut self.reduce_round_trip,
             };
             round_trip.emit_latency_from_nanos(sent, Nanos::now());
         }
@@ -210,21 +228,31 @@ impl PqAggregator {
     /// Drops the aggregations of slots before `floor`. The request in flight
     /// for one still occupies the leanVM sidecar until its response arrives.
     ///
-    /// Called as slot `floor + 1` starts, which ends the merge of slot
-    /// `floor`. The block of that slot may include the `POOL_SLOTS` slots up
-    /// to `floor - 1`. An ended merge stays until the rolling proof takes it.
+    /// Called as slot `floor + 1` starts. With a rolling proof that ends the
+    /// merge of slot `floor`, and the block of slot `floor + 1` may include
+    /// the `POOL_SLOTS` slots up to `floor - 1`. An ended merge stays until
+    /// the rolling proof takes it.
     pub fn prune_before(&mut self, floor: Slot) {
         self.leaves.retain(|leaf, _| leaf.slot >= floor);
-        self.rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
-        self.merges.retain(|&slot, _| self.rolling.awaits(slot));
-        self.changed = true;
+        match &mut self.rolling {
+            Some(rolling) => {
+                rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
+                self.merges.retain(|&slot, _| rolling.awaits(slot));
+                self.changed = true;
+            }
+            None => {
+                self.merges.retain(|&slot, _| slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ >= floor)
+            }
+        }
     }
 
     /// A block included the votes of `validators` for attestation slot
     /// `slot`: the rolling proof no longer needs them.
     pub fn on_chain(&mut self, slot: Slot, validators: &[u32]) {
-        self.rolling.include_on_chain(slot, validators);
-        self.changed = true;
+        if let Some(rolling) = &mut self.rolling {
+            rolling.include_on_chain(slot, validators);
+            self.changed = true;
+        }
     }
 
     /// Sends a batch of the highest priority aggregation, if the leanVM
@@ -272,22 +300,23 @@ impl PqAggregator {
         tcache: &mut TProducer,
     ) -> Option<(RollingJob, Option<TCacheRead>)> {
         let now = ticker.since_genesis();
+        let rolling = self.rolling.as_mut()?;
         loop {
-            if let Some(groups) = self.rolling.next_reduction() {
+            if let Some(groups) = rolling.next_reduction() {
                 let kept = claims_of(&groups);
-                let request = self.rolling.reduce_request(&kept)?;
+                let request = rolling.reduce_request(&kept)?;
                 let body = tcache.write_with(request.len(), |out| request.write(out));
                 return Some((RollingJob::Reduce { groups }, body));
             }
             let ended = |slot: &Slot| now >= ticker.slot_start(slot + 1);
             let slot = (self.merges.keys().copied())
-                .filter(|slot| ended(slot) && self.rolling.awaits(*slot))
+                .filter(|slot| ended(slot) && rolling.awaits(*slot))
                 .min()?;
             let Some(taken) = self.merges.remove(&slot).and_then(|merge| merge.proved()) else {
                 continue;
             };
-            let Some(request) = self.rolling.roll_request(&taken) else {
-                self.rolling.start_with(slot, taken);
+            let Some(request) = rolling.roll_request(&taken) else {
+                rolling.start_with(slot, taken);
                 continue;
             };
             let body = tcache.write_with(request.len(), |out| request.write(out));
@@ -306,7 +335,13 @@ impl PqAggregator {
 
     /// The attestations and proof for the body of the block at `slot`.
     pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
-        self.rolling.block_proof(slot)
+        match &self.rolling {
+            Some(rolling) => rolling.block_proof(slot),
+            None => {
+                let newest = slot.checked_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ)?;
+                self.merges.get(&newest)?.block_proof()
+            }
+        }
     }
 
     /// A pruned aggregation drops its batch.
@@ -314,7 +349,8 @@ impl PqAggregator {
         let (key, batch) = match job {
             Job::Batch(key, batch) => (key, batch),
             Job::Rolling(job) => {
-                if let Err(reason) = self.rolling.finish(job, body) {
+                let finished = self.rolling.as_mut().map(|rolling| rolling.finish(job, body));
+                if let Some(Err(reason)) = finished {
                     silver_log::warn!(reason, "rolling proof request failed");
                 }
                 return;

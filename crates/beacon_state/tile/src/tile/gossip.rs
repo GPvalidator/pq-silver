@@ -11,7 +11,7 @@ use silver_beacon_state_data::{
     SyncSubcommittee,
     bls::{self, CheckedSignature, PublicKey, Signature, VerifiedSingleAttestation},
     gloas::PTC_SIZE,
-    pq::xmss_pubkey,
+    pq::{MIN_ATTESTATION_INCLUSION_DELAY_PQ, xmss_pubkey},
     xmss::SignatureCheck,
 };
 use silver_common::{
@@ -2464,7 +2464,14 @@ impl BeaconStateTile {
     ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
         let (state_id, mut aggregate) = self.check_pq_aggregate(signed)?;
         self.verify_pq_aggregator(signed, state_id, &aggregate)?;
-        let merges = self.has_local_proposers();
+        // The rolling proof serves any later local proposal. Without it only
+        // the first block to include the aggregate uses it.
+        let merges = if self.pq_aggregator.is_rolling() {
+            self.has_local_proposers()
+        } else {
+            let block_slot = aggregate.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+            self.proposes_locally(block_slot)
+        };
 
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         let view = self.state.read_view(state_id);

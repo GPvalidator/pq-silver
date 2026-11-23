@@ -407,6 +407,12 @@ impl BeaconStateTile {
         tile
     }
 
+    /// Keeps a rolling proof of pooled PQ votes for local proposals. Off, a
+    /// proposal includes only the newest slot it may.
+    pub fn enable_pq_rolling_aggregate(&mut self) {
+        self.pq_aggregator.enable_rolling();
+    }
+
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {
         let bs = TileId::BeaconState;
         self.reader.open_forwarder(bs, TCacheId::ControlProcessing, TReadMode::Sliding)?;

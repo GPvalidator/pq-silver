@@ -3,7 +3,7 @@ use silver_common::{Nanos, TCacheRead, TProducer};
 use super::{
     aggregation::{Aggregation, Priority, VerifiedClaims},
     claims::{Aggregate, Group},
-    rolling::Proved,
+    rolling::{Proved, on_chain_attestations, united},
     strategy::{Batch, MarginalGain, Strategy},
     wire::MAX_PROOFS,
 };
@@ -59,10 +59,19 @@ impl MergeAggregation {
         self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
     }
 
+    fn covered_groups(&self) -> impl Iterator<Item = Group> + '_ {
+        self.core.covered_indices().iter().map(|&index| self.groups[index].clone())
+    }
+
     /// The best proof and the votes it covers. `None` without a best proof.
     pub(super) fn proved(&self) -> Option<Proved> {
         let (claims, proof) = self.core.best_proof()?;
-        let covered = self.core.covered_indices().iter().map(|&index| self.groups[index].clone());
-        Some(Proved::new(covered, claims.to_vec(), proof.to_vec()))
+        Some(Proved::new(self.covered_groups(), claims.to_vec(), proof.to_vec()))
+    }
+
+    /// The attestations the best proof covers, with it, for a block body.
+    pub(super) fn block_proof(&self) -> Option<(Vec<Vec<u8>>, &[u8])> {
+        let (_, proof) = self.core.best_proof()?;
+        Some((on_chain_attestations(&united(self.covered_groups())), proof))
     }
 }

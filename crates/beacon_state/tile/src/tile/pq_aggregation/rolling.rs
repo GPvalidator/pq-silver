@@ -41,31 +41,35 @@ impl Proved {
         self.groups.iter().map(|group| group.slot).max().unwrap_or(0)
     }
 
-    /// Spec `compute_on_chain_aggregate`, per attestation data: its committees
-    /// in index order.
     fn attestations(&self) -> Vec<Vec<u8>> {
-        let mut data_order: Vec<&Group> = Vec::new();
-        for group in &self.groups {
-            if !data_order.iter().any(|first| first.committee.data == group.committee.data) {
-                data_order.push(group);
-            }
-        }
-        let attestation = |first: &&Group| {
-            let data = &first.committee.data;
-            let mut committees: Vec<_> = (self.groups.iter())
-                .filter(|group| group.committee.data == *data)
-                .map(|group| (group.committee.index, group.bitlist()))
-                .collect();
-            committees.sort_unstable_by_key(|(index, _)| *index);
-            let committees = committees.iter().map(|(index, votes)| (*index, votes.as_slice()));
-            AttestationPqView::encode_committees(data, committees)
-                .expect("committees of one data ascend in range")
-        };
-        data_order.iter().map(attestation).collect()
+        on_chain_attestations(&self.groups)
     }
 }
 
-fn united(groups: impl IntoIterator<Item = Group>) -> Vec<Group> {
+/// Spec `compute_on_chain_aggregate`, per attestation data: its committees in
+/// index order. `groups` holds one group per committee and data.
+pub(super) fn on_chain_attestations(groups: &[Group]) -> Vec<Vec<u8>> {
+    let mut data_order: Vec<&Group> = Vec::new();
+    for group in groups {
+        if !data_order.iter().any(|first| first.committee.data == group.committee.data) {
+            data_order.push(group);
+        }
+    }
+    let attestation = |first: &&Group| {
+        let data = &first.committee.data;
+        let mut committees: Vec<_> = (groups.iter())
+            .filter(|group| group.committee.data == *data)
+            .map(|group| (group.committee.index, group.bitlist()))
+            .collect();
+        committees.sort_unstable_by_key(|(index, _)| *index);
+        let committees = committees.iter().map(|(index, votes)| (*index, votes.as_slice()));
+        AttestationPqView::encode_committees(data, committees)
+            .expect("committees of one data ascend in range")
+    };
+    data_order.iter().map(attestation).collect()
+}
+
+pub(super) fn united(groups: impl IntoIterator<Item = Group>) -> Vec<Group> {
     let mut united: Vec<Group> = Vec::new();
     for group in groups {
         match united.iter_mut().find(|held| held.committee == group.committee) {

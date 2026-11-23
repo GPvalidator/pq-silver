@@ -352,7 +352,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let checkpoint = boot_checkpoint.decompose(&chain_config.spec);
     control_tile
         .set_gossip_clock(ticker.clone(), &checkpoint.state().immutable.genesis_validators_root);
-    let beacon_state_tile = BeaconStateTile::new(
+    let mut beacon_state_tile = BeaconStateTile::new(
         ticker,
         spec.clone(),
         &config.syncing_config(),
@@ -363,6 +363,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.suggested_fee_recipient(),
         config.engine_config().get_payload_timeout(),
     );
+    if config.pq_rolling_aggregate() {
+        beacon_state_tile.enable_pq_rolling_aggregate();
+    }
     let state_reader = beacon_state_tile.reader();
 
     let storage_tile = StorageTile::new(

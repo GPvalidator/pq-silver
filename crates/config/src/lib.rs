@@ -233,6 +233,11 @@ pub struct Config {
     /// Unix socket of the leanVM sidecar.
     #[serde(default)]
     leanvm_socket: Option<String>,
+    /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
+    /// local proposal also includes votes older than the newest slot. Costs
+    /// about two more leanVM sidecar proofs each slot.
+    #[serde(default)]
+    pq_rolling_aggregate: bool,
 }
 
 impl Config {
@@ -354,6 +359,10 @@ impl Config {
 
     pub fn leanvm_socket(&self) -> Option<&str> {
         self.leanvm_socket.as_deref()
+    }
+
+    pub fn pq_rolling_aggregate(&self) -> bool {
+        self.pq_rolling_aggregate
     }
 
     pub fn enr(&self, keypair: &Keypair, enr_fork_id: [u8; 16]) -> Result<Enr, Error> {

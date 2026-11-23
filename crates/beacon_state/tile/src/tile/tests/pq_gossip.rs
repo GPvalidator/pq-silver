@@ -380,13 +380,13 @@ impl PqAggregate {
 }
 
 /// A proven aggregate goes to the leanVM sidecar again, as a merge, only
-/// when a proposer is registered here.
+/// when a validator registered here proposes the first block to include it.
 #[test]
-fn proven_aggregate_is_merged_with_a_local_proposer() {
+fn proven_aggregate_is_merged_for_a_local_proposal() {
     let key = SecretKey::new(&[7; 32]);
     for local in [false, true] {
         let (mut tile, mut gossip, _spine, mut adapter) =
-            pq_tile(&key.public_key(), 0, AGGREGATE_SLOT);
+            pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
         adapter.consume(|_: LeanVmReq, _| {});
         // Every validator shares one key, so two votes would be one claim.
         let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
@@ -400,7 +400,7 @@ fn proven_aggregate_is_merged_with_a_local_proposer() {
                 .encode(&mut preparation);
             tile.proposer_preparations.record(&preparation, 2);
         }
-        assert_eq!(tile.has_local_proposers(), local);
+        assert_eq!(tile.proposes_locally(AGGREGATE_SLOT + 2), local);
 
         let signed = &aggregate.signed;
         let msg = pq_gossip_msg(&tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);

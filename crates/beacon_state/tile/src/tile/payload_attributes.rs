@@ -67,6 +67,14 @@ impl PayloadBasis {
 impl BeaconStateTile {
     /// Whether a validator of this node proposes `slot` on the head: one
     /// registered here, or whose preferences were submitted here.
+    pub(super) fn proposes_locally(&self, slot: Slot) -> bool {
+        let Some(proposer) = self.proposer_on_head(slot) else { return false };
+        self.proposer_preparations.fee_recipient(proposer).is_some() ||
+            self.fork_choice
+                .shuffling_dependent_root(&self.head_block_root(), slot / SLOTS_PER_EPOCH)
+                .is_some_and(|root| self.seen_proposer_preferences.is_local(slot, &root))
+    }
+
     pub(super) fn has_local_proposers(&self) -> bool {
         !self.proposer_preparations.is_empty() || self.seen_proposer_preferences.any_local()
     }
