@@ -1,3 +1,4 @@
+pub mod attestations;
 pub mod cluster;
 pub mod counters;
 pub mod events;

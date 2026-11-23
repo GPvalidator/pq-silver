@@ -8,9 +8,11 @@ use super::{
     wire::MAX_PROOFS,
 };
 
-/// The aggregates of one attestation slot, proved as one proof. It ends when
-/// the next slot starts; the rolling proof then takes it in.
+/// The aggregates of one attestation slot, proved as one proof. Proving
+/// starts with the next slot, once the slot's aggregates are in, and ends when
+/// the first block to include them is due.
 pub(super) struct MergeAggregation {
+    opens: Nanos,
     /// The votes of each aggregate.
     groups: Vec<Group>,
     strategy: MarginalGain,
@@ -18,9 +20,9 @@ pub(super) struct MergeAggregation {
 }
 
 impl MergeAggregation {
-    pub(super) fn new(deadline: Nanos) -> Self {
+    pub(super) fn new(opens: Nanos, deadline: Nanos) -> Self {
         let (groups, strategy) = (Vec::new(), MarginalGain::default());
-        Self { groups, strategy, core: Aggregation::new(deadline) }
+        Self { opens, groups, strategy, core: Aggregation::new(deadline) }
     }
 
     /// `false` once the merge holds too many committees for another.
@@ -33,10 +35,10 @@ impl MergeAggregation {
         fits
     }
 
-    /// `None` when it has nothing to send: past its deadline, stopped, or no
-    /// waiting aggregate adds a position.
+    /// `None` when it has nothing to send: not yet open, past its deadline,
+    /// stopped, or no waiting aggregate adds a position.
     pub(super) fn priority(&self, now: Nanos) -> Option<Priority> {
-        self.core.priority(now, self.strategy.waiting())
+        (now >= self.opens).then(|| self.core.priority(now, self.strategy.waiting()))?
     }
 
     /// `None` exactly when `priority` is, unless the strategy has a bug. The
@@ -57,6 +59,10 @@ impl MergeAggregation {
 
     pub(super) fn finish(&mut self, batch: Batch, body: Option<&[u8]>) -> Result<(), &'static str> {
         self.core.finish(&batch, body).map(|()| self.strategy.adopted(&batch))
+    }
+
+    pub(super) fn is_proved(&self) -> bool {
+        self.core.best_proof().is_some()
     }
 
     fn covered_groups(&self) -> impl Iterator<Item = Group> + '_ {

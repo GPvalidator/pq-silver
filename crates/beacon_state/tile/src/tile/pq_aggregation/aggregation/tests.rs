@@ -47,7 +47,7 @@ fn best_claims(core: &Aggregation) -> usize {
 }
 
 fn merge(children: impl IntoIterator<Item = Aggregate>) -> MergeAggregation {
-    let mut merge = MergeAggregation::new(DEADLINE);
+    let mut merge = MergeAggregation::new(Nanos(0), DEADLINE);
     children.into_iter().for_each(|child| assert!(merge.add(child)));
     merge
 }

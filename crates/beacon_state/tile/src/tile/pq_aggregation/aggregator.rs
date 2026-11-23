@@ -170,22 +170,21 @@ impl PqAggregator {
         self.changed = true;
     }
 
-    /// `aggregate` is verified. It joins the merge of its attestation slot.
-    /// That merge ends when the first block to include it is due, or with
-    /// the slot when the rolling proof takes it in. A merge refuses it once
-    /// it holds too many committees.
+    /// `aggregate` is verified. It joins the merge of its attestation slot,
+    /// until the first block to include it is due or the rolling proof has
+    /// taken the merge in. A merge refuses it once it holds too many
+    /// committees.
     pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
         BeaconStateCounters::PqMergeClaimsOffered.add(aggregate.claims.len() as u64);
         let slot = aggregate.group.slot;
-        let (deadline, awaited) = match &self.rolling {
-            Some(rolling) => (ticker.slot_start(slot + 1), rolling.awaits(slot)),
-            None => (ticker.slot_start(slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ), true),
-        };
+        let deadline = ticker.slot_start(slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ);
+        let awaited = self.rolling.as_ref().is_none_or(|rolling| rolling.awaits(slot));
         if ticker.since_genesis() >= deadline || !awaited {
             silver_log::debug!(slot, "aggregate after its slot's merge ended");
             return;
         }
-        let merge = self.merges.entry(slot).or_insert_with(|| MergeAggregation::new(deadline));
+        let merge = (self.merges.entry(slot))
+            .or_insert_with(|| MergeAggregation::new(ticker.slot_start(slot + 1), deadline));
         if !merge.add(aggregate) {
             silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
             return;
@@ -229,22 +228,16 @@ impl PqAggregator {
     /// Drops the aggregations of slots before `floor`. The request in flight
     /// for one still occupies the leanVM sidecar until its response arrives.
     ///
-    /// Called as slot `floor + 1` starts. With a rolling proof that ends the
-    /// merge of slot `floor`, and the block of slot `floor + 1` may include
-    /// the `POOL_SLOTS` slots up to `floor - 1`. An ended merge stays until
-    /// the rolling proof takes it.
+    /// Called as slot `floor + 1` starts, which opens the merge of slot
+    /// `floor`. The block of slot `floor + 1` may include the `POOL_SLOTS`
+    /// slots up to `floor - 1`.
     pub fn prune_before(&mut self, floor: Slot) {
         self.leaves.retain(|leaf, _| leaf.slot >= floor);
-        match &mut self.rolling {
-            Some(rolling) => {
-                rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
-                self.merges.retain(|&slot, _| rolling.awaits(slot));
-                self.changed = true;
-            }
-            None => {
-                self.merges.retain(|&slot, _| slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ >= floor)
-            }
+        self.merges.retain(|&slot, _| slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ >= floor);
+        if let Some(rolling) = &mut self.rolling {
+            rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
         }
+        self.changed = true;
     }
 
     /// A block included the votes of `validators` for attestation slot
@@ -299,6 +292,9 @@ impl PqAggregator {
     /// with its request written to `tcache`, or `None` for a full tcache.
     /// Changes that need no proof are made here. It goes ahead of every
     /// batch: there are at most two a slot, and a proposal waits on them.
+    ///
+    /// A slot's merge is taken in once it has nothing left to prove. The
+    /// merge itself stays, for a block whose rolling proof lacks that slot.
     fn next_rolling_request(
         &mut self,
         ticker: &SlotTicker,
@@ -313,13 +309,13 @@ impl PqAggregator {
                 let body = tcache.write_with(request.len(), |out| request.write(out));
                 return Some((RollingJob::Reduce { groups }, body));
             }
-            let ended = |slot: &Slot| now >= ticker.slot_start(slot + 1);
-            let slot = (self.merges.keys().copied())
-                .filter(|slot| ended(slot) && rolling.awaits(*slot))
-                .min()?;
-            let Some(taken) = self.merges.remove(&slot).and_then(|merge| merge.proved()) else {
-                continue;
-            };
+            let (&slot, merge) = (self.merges.iter())
+                .filter(|(slot, merge)| rolling.awaits(**slot) && merge.is_proved())
+                .min_by_key(|(slot, _)| **slot)?;
+            if now < ticker.slot_start(slot + 1) || merge.priority(now).is_some() {
+                return None;
+            }
+            let taken = merge.proved()?;
             let Some(request) = rolling.roll_request(&taken) else {
                 rolling.start_with(slot, taken);
                 continue;
@@ -340,13 +336,12 @@ impl PqAggregator {
 
     /// The attestations and proof for the body of the block at `slot`.
     pub fn block_proof(&self, slot: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
-        match &self.rolling {
-            Some(rolling) => rolling.block_proof(slot),
-            None => {
-                let newest = slot.checked_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ)?;
-                self.merges.get(&newest)?.block_proof()
-            }
-        }
+        let newest = slot.checked_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ)?;
+        let merged = self.merges.get(&newest).and_then(|merge| merge.block_proof());
+        let Some(rolling) = &self.rolling else { return merged };
+        // The rolling proof lacks the newest slot until its roll is proved,
+        // and for good if that roll failed.
+        rolling.block_proof_through(newest).or(merged).or_else(|| rolling.block_proof(slot))
     }
 
     /// A pruned aggregation drops its batch.

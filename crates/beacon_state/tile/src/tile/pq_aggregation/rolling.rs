@@ -148,6 +148,13 @@ impl Rolling {
         Some((proved.attestations(), &proved.proof))
     }
 
+    /// The current proof and its attestations, if it holds votes of
+    /// attestation slot `newest` and none newer.
+    pub(super) fn block_proof_through(&self, newest: Slot) -> Option<(Vec<Vec<u8>>, &[u8])> {
+        let current = self.current.as_ref().filter(|current| current.newest_slot() == newest)?;
+        Some((current.attestations(), &current.proof))
+    }
+
     /// The votes of the current proof that are neither on chain nor too old,
     /// when that leaves some out.
     fn reduced(&self) -> Option<Vec<Group>> {
