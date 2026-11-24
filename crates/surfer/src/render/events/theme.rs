@@ -11,6 +11,8 @@ use crate::sources::events::{BlockTrace, DaSpan, Margin, Span, StfSpan};
 #[derive(Clone, Copy)]
 pub struct Symbols {
     pub bar: char,
+    /// A local vote on a block's strip.
+    pub vote: char,
     pub tick: char,
     pub separator: &'static str,
     pub fold_open: &'static str,
@@ -22,6 +24,7 @@ impl Default for Symbols {
     fn default() -> Self {
         Self {
             bar: '█',
+            vote: '◆',
             tick: '╌',
             separator: " │ ",
             fold_open: "▾ ",

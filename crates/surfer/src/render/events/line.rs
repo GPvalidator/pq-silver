@@ -128,6 +128,9 @@ pub struct RowCells {
     pub source: String,
     /// Into-slot offset of the gate, where a data row's bar changes colour.
     split: Option<Nanos>,
+    /// Into-slot offsets of the first and last local vote, on a block's strip.
+    votes: [Option<Nanos>; 2],
+    vote_style: Style,
     bar: (Style, Style),
     label_style: Style,
 }
@@ -153,6 +156,12 @@ impl RowCells {
             true => trace.da.available().and_then(|gate| trace.offset_in_slot(clock, gate)),
             false => None,
         };
+        let votes = match (node, trace.interval(Span::LocalVotes)) {
+            (Node::Span(Span::Strip), Some(votes)) => {
+                [votes.start, votes.end].map(|at| trace.offset_in_slot(clock, at))
+            }
+            _ => [None; 2],
+        };
         Self {
             label: label(trace, display, theme),
             root: match node {
@@ -175,6 +184,8 @@ impl RowCells {
                 _ => String::new(),
             },
             split,
+            votes,
+            vote_style: theme.bar(trace, Node::Span(Span::LocalVotes)).0,
             bar: theme.bar(trace, node),
             label_style: theme.label(trace, node),
         }
@@ -200,6 +211,18 @@ impl RowCells {
         let margin_text = self.margin_text();
         let duration_style = self.duration_style();
         let (before, after) = axis.split_bar(self.offset, self.len, self.split);
+        let mut bar: Vec<(char, Style)> = (before.chars().map(|c| (c, self.bar.0)))
+            .chain(after.chars().map(|c| (c, self.bar.1)))
+            .collect();
+        for cell in self.votes.into_iter().flatten().filter_map(|at| axis.cell(at)) {
+            if let Some(drawn) = bar.get_mut(cell) {
+                *drawn = (theme.symbols.vote, self.vote_style);
+            }
+        }
+        let bar = bar
+            .chunk_by(|a, b| a.1 == b.1)
+            .map(|run| TextSpan::styled(run.iter().map(|(c, _)| c).collect::<String>(), run[0].1))
+            .collect();
         let one = |text, style| vec![TextSpan::styled(text, style)];
         grid.line(
             [
@@ -208,7 +231,7 @@ impl RowCells {
                 one(self.time, theme.text()),
                 one(self.start, theme.text()),
                 one(self.end, theme.text()),
-                vec![TextSpan::styled(before, self.bar.0), TextSpan::styled(after, self.bar.1)],
+                bar,
                 one(self.duration, duration_style),
                 one(margin_text, theme.margin(self.margin)),
                 one(self.source, theme.text()),
@@ -271,7 +294,10 @@ fn attributes(trace: &BlockTrace, node: Node) -> String {
             let gate = if trace.da.opened_gate(&batch) { " DA" } else { "" };
             format!("{} cols{gate}", batch.columns.len())
         }
-        Node::Span(Span::LocalVotes) => format!("{} votes", trace.local_votes.count),
+        Node::Span(Span::LocalVotes) => match trace.local_votes.count {
+            1 => "1 vote".to_string(),
+            count => format!("{count} votes"),
+        },
         Node::Span(Span::El) => {
             trace.el.status().map_or_else(String::new, |v| status_label(v).to_string())
         }
@@ -437,6 +463,28 @@ mod tests {
         let duration = line.spans.iter().find(|s| s.content == "140ms").unwrap();
         assert_eq!(duration.style.fg, Some(theme.components.apply), "duration matches its bar");
         assert!(line.spans.iter().any(|s| s.content == theme.symbols.separator));
+    }
+
+    /// A folded block still shows when this node's validators voted for it.
+    #[test]
+    fn the_strip_marks_local_votes_where_they_were_accepted() {
+        let theme = Theme::default();
+        let voted =
+            trace(&[(received(), 300), (Stage::Attestable, 460), (Stage::LocalAttestation, 2_000)]);
+        let cells = all_rows(voted, &theme);
+        let grid = Grid::fit(cells.iter().map(|(_, c)| c), INNER_WIDTH, &theme);
+        let axis = Axis::fit(grid.axis, DEADLINE, Nanos(0), theme.symbols);
+        let at = axis.cell(Nanos::from_millis(2_000)).unwrap();
+        let (_, strip) =
+            cells.into_iter().find(|(d, _)| d.node == Node::Span(Span::Strip)).unwrap();
+
+        let line = strip.into_line(&grid, &axis, &theme);
+        let mark = line.spans.iter().find(|s| s.content.contains(theme.symbols.vote)).unwrap();
+        assert_eq!(mark.style.fg, Some(theme.components.local_votes));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let column = |symbol| text.chars().position(|c| c == symbol).unwrap();
+        let arrival = axis.cell(Nanos::from_millis(300)).unwrap();
+        assert_eq!(column(theme.symbols.vote) - column(theme.symbols.bar), at - arrival);
     }
 
     /// A custody row's bar changes colour at the gate; rows ending after it

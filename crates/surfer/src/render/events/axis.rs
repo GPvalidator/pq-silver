@@ -16,7 +16,8 @@ impl Axis {
         Self { width, range, bar: symbols.bar, tick: symbols.tick }
     }
 
-    fn cell(&self, offset: Nanos) -> Option<usize> {
+    /// `None` past the axis.
+    pub fn cell(&self, offset: Nanos) -> Option<usize> {
         let cell = (offset.0 as u128 * self.width as u128 / self.range.0 as u128) as usize;
         (cell < self.width).then_some(cell)
     }

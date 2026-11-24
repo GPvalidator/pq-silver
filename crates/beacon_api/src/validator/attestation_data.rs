@@ -1,7 +1,10 @@
 use serde::Deserialize;
 use silver_beacon_state_data::{B256, Checkpoint, Epoch, SLOTS_PER_EPOCH, Slot, StateReadView};
 use silver_common::{
-    json_fields::{bytes, parse_uint64, uint64}, ssz_hash::hash_attestation_data, ssz_view::{AttestationDataView, ATTESTATION_DATA_SIZE}, PayloadResolution
+    PayloadResolution,
+    json_fields::{bytes, parse_uint64, uint64},
+    ssz_hash::hash_attestation_data,
+    ssz_view::{ATTESTATION_DATA_SIZE, AttestationDataView},
 };
 
 use crate::{
