@@ -749,6 +749,11 @@ impl Tile<SilverSpine> for Controller {
 
         let wall_slot =
             self.gossip_schedule.as_ref().map(|schedule| schedule.ticker.current_slot());
+        #[cfg(feature = "seacast")]
+        if let Some(schedule) = &self.gossip_schedule {
+            let (slot, start) = schedule.ticker.current_slot_start();
+            self.gossip_handler.seacast_clock(slot, start, schedule.ticker.slot_duration());
+        }
 
         adapter.consume(|request: BeaconApiRequest, producers| match request {
             BeaconApiRequest::LocalGossip { request_id, topic, ssz, validation, .. } => {
@@ -832,6 +837,8 @@ impl Tile<SilverSpine> for Controller {
             {
                 self.publication_timers.attestation(*originator_stream_id, &schedule.ticker);
             }
+            #[cfg(feature = "seacast")]
+            self.gossip_handler.seacast_peer_event(&event);
 
             if let Some(exchange) = &mut self.partial_exchange {
                 exchange.peer_event(&event, now);

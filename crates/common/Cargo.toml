@@ -51,6 +51,8 @@ alloc-profile = ["silver_metrics/alloc-profile"]
 perf = ["silver_metrics/perf"]
 test-util = ["dep:tempfile"]
 thread_park = ["flux/park"]
+# The SEACAST store's tcache id.
+seacast = []
 
 
 [dev-dependencies]

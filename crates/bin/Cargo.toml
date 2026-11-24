@@ -55,6 +55,8 @@ perf = ["silver_common/perf"]
 # The spec's minimal preset in place of mainnet's. Preset values size types, so
 # a binary runs exactly one.
 minimal = ["silver_preset/minimal"]
+# SEACAST chunked diffusion of the execution payload envelope.
+seacast = ["silver_control/seacast"]
 thread_park = [
   "flux/park",
   "silver_application_boundary/thread_park",
