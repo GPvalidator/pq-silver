@@ -37,7 +37,7 @@ pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     out
 }
 
-fn request() -> Request {
+fn request() -> Request<'static> {
     let xmss = (
         LeanXmssPublicKey::from_bytes(&[1; lean_xmss::PUB_KEY_SIZE]),
         [2; lean_xmss::MESSAGE_LEN],
@@ -54,7 +54,7 @@ fn request() -> Request {
         da_commitment: Some([5; 32]),
     };
     Request {
-        children: vec![(only.clone(), vec![6, 7, 8])],
+        children: vec![(only.clone(), &[6, 7, 8])],
         raw_lean_xmss: vec![xmss],
         raw_lean_sphincs: vec![sphincs],
         blobs: vec![std::array::from_fn(|i| ((i as u128) << 100) | i as u128)],
@@ -66,10 +66,8 @@ fn request() -> Request {
 #[test]
 fn a_request_decodes_to_what_was_encoded() {
     let request = request();
-    let Ok(Call::Aggregate(decoded)) = decode_request(&encode_request(&request)) else {
-        panic!("not an aggregate request")
-    };
-    assert_eq!(decoded, request);
+    let bytes = encode_request(&request);
+    assert_eq!(decode_aggregate(&bytes).expect("an aggregate request"), request);
 }
 
 /// Every truncation, and a trailing byte, is refused, never a panic.
@@ -78,26 +76,26 @@ fn truncations_and_trailing_bytes_are_refused() {
     let bytes = encode_request(&request());
     assert!(!is_verify(&bytes));
     for len in 0..bytes.len() {
-        assert!(decode_request(&bytes[..len]).is_err(), "a prefix of {len} bytes decoded");
+        assert!(decode_aggregate(&bytes[..len]).is_err(), "a prefix of {len} bytes decoded");
     }
-    assert!(decode_request(&[&bytes[..], &[0]].concat()).is_err());
+    assert!(decode_aggregate(&[&bytes[..], &[0]].concat()).is_err());
 }
 
 #[test]
 fn counts_past_the_body_or_the_bounds_are_refused() {
     let mut huge = vec![OP_AGGREGATE, 1];
     huge.extend(u64::MAX.to_le_bytes());
-    assert!(matches!(decode_request(&huge), Err(Refusal { why: Rejection::Malformed, .. })));
+    assert!(matches!(decode_aggregate(&huge), Err(Refusal { why: Rejection::Malformed, .. })));
 
     let mut many = request();
-    many.children = vec![(AggregateClaims::default(), Vec::new()); MAX_RECURSIONS + 1];
-    let refused = decode_request(&encode_request(&many));
-    assert!(matches!(refused, Err(Refusal { why: Rejection::InvalidInput, .. })));
+    many.children = vec![(AggregateClaims::default(), &[][..]); MAX_RECURSIONS + 1];
+    let bytes = encode_request(&many);
+    assert!(matches!(decode_aggregate(&bytes), Err(Refusal { why: Rejection::InvalidInput, .. })));
 
     let mut many = request();
     many.blobs = vec![[0; lean_da::BLOB_SYMBOLS]; lean_da::DA_MAX_ROWS + 1];
-    let refused = decode_request(&encode_request(&many));
-    assert!(matches!(refused, Err(Refusal { why: Rejection::InvalidInput, .. })));
+    let bytes = encode_request(&many);
+    assert!(matches!(decode_aggregate(&bytes), Err(Refusal { why: Rejection::InvalidInput, .. })));
 }
 
 #[test]
@@ -107,9 +105,17 @@ fn a_verify_request_decodes() {
     put_bytes(&mut bytes, &claims.to_bytes());
     put_bytes(&mut bytes, &[9, 9]);
     assert!(is_verify(&bytes));
-    let Ok(Call::Verify(decoded, proof)) = decode_request(&bytes) else { panic!("not a verify") };
-    assert_eq!((decoded, proof), (claims, vec![9, 9]));
-    assert!(matches!(decode_request(&[7]), Err(Refusal { why: Rejection::Malformed, .. })));
+    let decoded = decode_verify(&bytes).expect("a verify request");
+    assert_eq!(decoded, (claims, &[9, 9][..]));
+}
+
+/// Any body that is not a verify reaches the aggregate decoder.
+#[test]
+fn unknown_and_empty_bodies_are_malformed() {
+    for body in [&[7][..], &[]] {
+        let refused = decode_aggregate(body);
+        assert!(matches!(refused, Err(Refusal { why: Rejection::Malformed, .. })));
+    }
 }
 
 #[test]

@@ -35,7 +35,7 @@ use silver_common::{
     IngestionTime, LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId,
     TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode,
 };
-use wire::{Call, Refusal, Rejection, Request};
+use wire::{Refusal, Rejection};
 
 /// Aggregates taken off the spine and waiting for the prover. `beacon_state`
 /// keeps one in flight, so a full queue means it lost track; past it each
@@ -86,7 +86,7 @@ impl Tile<SilverSpine> for LeanVmTile {
         self.collect_verdicts();
         self.intake(adapter);
         if let Some((request_id, body)) = self.aggregates.pop_front() {
-            let response = respond(&body);
+            let response = prove(&body);
             self.answer(request_id, Some(&response));
             adapter.mark_work();
         }
@@ -253,45 +253,49 @@ fn warm_up() {
         .expect("the warm-up's recursion proves");
 }
 
-/// The sidecar's response to one request body.
-fn respond(body: &[u8]) -> Vec<u8> {
-    match wire::decode_request(body) {
-        Ok(Call::Verify(claims, proof)) => {
-            let valid = AggregateProof::from_bytes(&proof).is_some_and(|p| p.verify(&claims));
+/// The sidecar's response to a verify body.
+fn verify(body: &[u8]) -> Vec<u8> {
+    match wire::decode_verify(body) {
+        Ok((claims, proof)) => {
+            let valid = AggregateProof::from_bytes(proof).is_some_and(|p| p.verify(&claims));
             wire::encode_verdict(valid).to_vec()
         }
-        Ok(Call::Aggregate(request)) => match aggregate(request) {
-            Ok((claims, proof)) => wire::encode_proven(&claims, &proof),
-            Err(refusal) => refusal.encode(),
-        },
-        Err(refusal) => {
-            silver_log::warn!(rejection = ?refusal.why, message = refusal.message, "leanvm request refused");
-            refusal.encode()
-        }
+        Err(refusal) => refuse(&refusal),
     }
 }
 
-fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), Refusal> {
+/// The sidecar's response to any other body. Proves on the calling thread.
+fn prove(body: &[u8]) -> Vec<u8> {
+    let request = match wire::decode_aggregate(body) {
+        Ok(request) => request,
+        Err(refusal) => return refuse(&refusal),
+    };
     let started = Instant::now();
     let shape = (request.children.len(), request.raw_lean_xmss.len(), request.log_inv_rate);
     let children = request
         .children
         .into_iter()
         .enumerate()
-        .map(|(i, (claims, proof))| match AggregateProof::from_bytes(&proof) {
+        .map(|(i, (claims, proof))| match AggregateProof::from_bytes(proof) {
             Some(proof) => Ok((claims, proof)),
             None => {
                 let message = format!("child {i}'s proof does not decode");
                 Err(Refusal { why: Rejection::InvalidChild, message })
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>();
+    let children = match children {
+        Ok(children) => children,
+        Err(refusal) => return refusal.encode(),
+    };
     let blobs = match request.blobs.len() {
         0 => None,
-        _ => Some(
-            lean_vm::lean_da::BlobMatrix::build(&request.blobs)
-                .map_err(|e| Refusal { why: Rejection::InvalidInput, message: e.to_string() })?,
-        ),
+        _ => match lean_vm::lean_da::BlobMatrix::build(&request.blobs) {
+            Ok(blobs) => Some(blobs),
+            Err(e) => {
+                return Refusal { why: Rejection::InvalidInput, message: e.to_string() }.encode()
+            }
+        },
     };
     let output = request.output.as_ref().map_or(OutputClaims::All, OutputClaims::Only);
     let outcome = lean_vm::aggregate(
@@ -307,13 +311,19 @@ fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), Re
     match outcome {
         Ok((claims, proof)) => {
             silver_log::info!(children, signatures, rate, ?elapsed, "leanvm proven");
-            Ok((claims, proof.to_bytes()))
+            wire::encode_proven(&claims, &proof.to_bytes())
         }
         Err(error) => {
             silver_log::warn!(children, signatures, rate, ?elapsed, %error, "leanvm refused");
-            Err(Refusal { why: error.into(), message: error.to_string() })
+            Refusal { why: error.into(), message: error.to_string() }.encode()
         }
     }
+}
+
+/// A body that is not a request.
+fn refuse(refusal: &Refusal) -> Vec<u8> {
+    silver_log::warn!(rejection = ?refusal.why, message = refusal.message, "leanvm request refused");
+    refusal.encode()
 }
 
 /// The verify threads: each takes one request body at a time from a shared
@@ -340,7 +350,7 @@ impl Verifier {
                         let job = queue.lock().unwrap().recv();
                         // Ends with the tile, which drops the sender.
                         let Ok((request_id, body)) = job else { return };
-                        if results.send((request_id, respond(&body))).is_err() {
+                        if results.send((request_id, verify(&body))).is_err() {
                             return;
                         }
                     }

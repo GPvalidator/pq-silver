@@ -63,17 +63,10 @@ impl Refusal {
     }
 }
 
-/// A request, decoded.
-pub enum Call {
-    Aggregate(Request),
-    /// Claims, and their proof's bytes.
-    Verify(AggregateClaims, Vec<u8>),
-}
-
 /// An `aggregate` call, its children's proofs still bytes.
 #[derive(Debug, PartialEq)]
-pub struct Request {
-    pub children: Vec<(AggregateClaims, Vec<u8>)>,
+pub struct Request<'a> {
+    pub children: Vec<(AggregateClaims, &'a [u8])>,
     pub raw_lean_xmss: Vec<(LeanXmssPublicKey, lean_xmss::Message, LeanXmssSignature)>,
     pub raw_lean_sphincs: Vec<(LeanSphincsPublicKey, lean_sphincs::Message, LeanSphincsSignature)>,
     pub blobs: Vec<lean_da::Blob>,
@@ -88,29 +81,20 @@ pub fn is_verify(body: &[u8]) -> bool {
     body.first() == Some(&OP_VERIFY)
 }
 
-pub fn decode_request(body: &[u8]) -> Result<Call, Refusal> {
+/// A `verify` call: the claims, and their proof's bytes.
+pub fn decode_verify(body: &[u8]) -> Result<(AggregateClaims, &[u8]), Refusal> {
     let mut c = Cursor(body);
-    let call = match c.u8() {
-        Some(OP_AGGREGATE) => Call::Aggregate(decode_aggregate(&mut c)?),
-        Some(OP_VERIFY) => {
-            let claims = c.claims().ok_or_else(|| Refusal::malformed("claims"))?;
-            let proof = c.bytes().ok_or_else(|| Refusal::malformed("proof"))?;
-            Call::Verify(claims, proof.to_vec())
-        }
-        Some(op) => {
-            let message = format!("unknown operation {op}");
-            return Err(Refusal { why: Rejection::Malformed, message });
-        }
-        None => return Err(Refusal::malformed("empty")),
-    };
-    if !c.is_empty() {
-        return Err(Refusal::malformed("trailing bytes"));
-    }
-    Ok(call)
+    c.op(OP_VERIFY)?;
+    let claims = c.claims().ok_or_else(|| Refusal::malformed("claims"))?;
+    let proof = c.bytes().ok_or_else(|| Refusal::malformed("proof"))?;
+    c.end()?;
+    Ok((claims, proof))
 }
 
-fn decode_aggregate(c: &mut Cursor) -> Result<Request, Refusal> {
+pub fn decode_aggregate(body: &[u8]) -> Result<Request<'_>, Refusal> {
     let malformed = Refusal::malformed;
+    let mut c = Cursor(body);
+    c.op(OP_AGGREGATE)?;
     let log_inv_rate = c.u8().ok_or_else(|| malformed("no rate"))?.into();
 
     // Each child is at least its two lengths.
@@ -124,7 +108,7 @@ fn decode_aggregate(c: &mut Cursor) -> Result<Request, Refusal> {
     for i in 0..n {
         let claims = c.claims().ok_or_else(|| malformed(&format!("child {i}'s claims")))?;
         let proof = c.bytes().ok_or_else(|| malformed(&format!("child {i}'s proof")))?;
-        children.push((claims, proof.to_vec()));
+        children.push((claims, proof));
     }
 
     // `count` checked that every record follows, so the reads below succeed.
@@ -162,6 +146,7 @@ fn decode_aggregate(c: &mut Cursor) -> Result<Request, Refusal> {
         Some(1) => Some(c.claims().ok_or_else(|| malformed("output claims"))?),
         _ => return Err(malformed("output")),
     };
+    c.end()?;
     Ok(Request { children, raw_lean_xmss, raw_lean_sphincs, blobs, output, log_inv_rate })
 }
 
@@ -221,8 +206,19 @@ impl<'a> Cursor<'a> {
         (n.checked_mul(size)? <= self.0.len()).then_some(n)
     }
 
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    fn op(&mut self, expected: u8) -> Result<(), Refusal> {
+        match self.u8() {
+            Some(op) if op == expected => Ok(()),
+            Some(op) => {
+                let message = format!("unknown operation {op}");
+                Err(Refusal { why: Rejection::Malformed, message })
+            }
+            None => Err(Refusal::malformed("empty")),
+        }
+    }
+
+    fn end(&self) -> Result<(), Refusal> {
+        if self.0.is_empty() { Ok(()) } else { Err(Refusal::malformed("trailing bytes")) }
     }
 }
 

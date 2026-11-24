@@ -173,10 +173,7 @@ fn the_tile_proves_and_verifies_as_the_sidecar_did() {
     // and their verdicts are published once that proof ends.
     rig.request(
         2,
-        &encode_request(&request(raw_lean_xmss[2..].to_vec(), vec![(
-            claims.clone(),
-            proof.clone(),
-        )])),
+        &encode_request(&request(raw_lean_xmss[2..].to_vec(), vec![(claims.clone(), &proof)])),
     );
     let mut fewer = claims.clone();
     fewer.lean_xmss.pop();
