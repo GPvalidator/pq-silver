@@ -32,8 +32,8 @@ use std::{
 use flux::{spine::SpineAdapter, tile::Tile, utils::try_thread_boot};
 use lean_vm::{AggregateProof, OutputClaims};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId, TCacheProducer,
-    TCacheReader, TCacheTable, TProducer, TReadMode,
+    IngestionTime, LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId,
+    TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode,
 };
 use wire::{Call, Rejection, Request};
 
@@ -46,16 +46,19 @@ const MAX_QUEUED_AGGREGATES: usize = 16;
 const MAX_VERIFIES: usize = 16;
 
 pub struct LeanVmTile {
-    /// The tile's core first; the prover runs on all of them. Empty: no
-    /// prover, and every request is answered `None`.
-    cores: Vec<usize>,
+    prover: Prover,
     reader: TCacheReader,
     producer: TProducer,
-    /// From `try_init` on, with a prover.
-    verifier: Option<Verifier>,
     aggregates: VecDeque<(u64, Vec<u8>)>,
     answers: Vec<LeanVmResp>,
-    ready_published: bool,
+}
+
+enum Prover {
+    /// No cores: every request is answered `None`.
+    Off,
+    /// The tile's core first. Starts in `try_init`, on the tile's thread.
+    Cold(Vec<usize>),
+    Warm(Verifier),
 }
 
 impl Tile<SilverSpine> for LeanVmTile {
@@ -65,10 +68,15 @@ impl Tile<SilverSpine> for LeanVmTile {
         adapter.subscribe_broadcast::<LeanVmReq>();
     }
 
-    fn try_init(&mut self, _: &mut SpineAdapter<SilverSpine>) -> bool {
+    /// Announces the prover before the first loop, so a reader sees it ready
+    /// before its first answer.
+    fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
         self.open_tcaches().expect("tcache wiring");
-        if !self.cores.is_empty() {
-            self.verifier = Some(start_prover(&self.cores));
+        if let Prover::Cold(cores) = &self.prover {
+            self.prover = Prover::Warm(start_prover(cores));
+            silver_log::info!("leanvm prover ready");
+            adapter.set_ingestion_time(IngestionTime::now());
+            adapter.produce(LeanVmHealthEvent { ready: true });
         }
         true
     }
@@ -91,13 +99,11 @@ impl LeanVmTile {
     /// to, then the prover's other cores. Empty for no prover.
     pub fn new(cores: Vec<usize>, tcaches: TCacheTable, producer: TProducer) -> Self {
         Self {
-            cores,
+            prover: if cores.is_empty() { Prover::Off } else { Prover::Cold(cores) },
             reader: TCacheReader::new(tcaches),
             producer,
-            verifier: None,
             aggregates: VecDeque::new(),
             answers: Vec::new(),
-            ready_published: false,
         }
     }
 
@@ -114,10 +120,10 @@ impl LeanVmTile {
     fn intake(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
         // The previous pass drained the queue.
         self.reader.free();
-        let Self { reader, verifier, aggregates, answers, .. } = self;
+        let Self { prover, reader, aggregates, answers, .. } = self;
         adapter.consume(|req: LeanVmReq, _| {
             let request_id = req.request_id;
-            let taken = verifier.as_mut().and_then(|verifier| {
+            let taken = prover.verifier().and_then(|verifier| {
                 let body = copy_body(reader, req)?;
                 if wire::is_verify(&body) {
                     verifier.send(request_id, body)
@@ -136,7 +142,7 @@ impl LeanVmTile {
     }
 
     fn collect_verdicts(&mut self) {
-        while let Some((request_id, response)) = self.verifier.as_mut().and_then(Verifier::try_recv)
+        while let Some((request_id, response)) = self.prover.verifier().and_then(Verifier::try_recv)
         {
             self.answer(request_id, Some(&response));
         }
@@ -154,16 +160,18 @@ impl LeanVmTile {
         self.answers.push(LeanVmResp { request_id, body });
     }
 
-    /// Health before answers, so a reader sees the prover ready before its
-    /// first answer.
     fn publish(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
-        if self.verifier.is_some() && !self.ready_published {
-            silver_log::info!("leanvm prover ready");
-            self.ready_published = true;
-            adapter.produce(LeanVmHealthEvent { ready: true });
-        }
         for resp in self.answers.drain(..) {
             adapter.produce(resp);
+        }
+    }
+}
+
+impl Prover {
+    fn verifier(&mut self) -> Option<&mut Verifier> {
+        match self {
+            Self::Warm(verifier) => Some(verifier),
+            Self::Off | Self::Cold(_) => None,
         }
     }
 }
