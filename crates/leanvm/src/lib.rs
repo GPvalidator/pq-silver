@@ -8,9 +8,12 @@
 //!
 //! The tile's thread proves. leanVM's pool runs the thread that calls
 //! `aggregate` as its worker 0, so the tile's core is a prover core, and the
-//! pool's other workers run on the rest of the prover cores. A proof blocks
-//! the tile for its duration. Verifies run beside it on their own threads,
-//! as on the sidecar's connection threads, one request each at a time.
+//! pool's other workers run on the rest of the prover cores.
+//!
+//! A proof blocks the tile for its duration. Requests arriving during a proof
+//! are taken once it ends, and verdicts reached during it are published then.
+//! Verifies run on their own threads, one request each at a time. The sidecar
+//! answered verifies during a proof; this tile answers them after it.
 
 #[cfg(test)]
 mod tests;

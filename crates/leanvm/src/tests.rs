@@ -169,7 +169,8 @@ fn the_tile_proves_and_verifies_as_the_sidecar_did() {
     let (claims, proof) = proven(&rig.answer(1).expect("a response"));
     assert_eq!(claims.lean_xmss.len(), 2);
 
-    // One crank takes all three: the verifies run while the tile proves 2.
+    // One crank takes all three. The verifies run while the tile proves 2,
+    // and their verdicts are published once that proof ends.
     rig.request(
         2,
         &encode_request(&request(raw_lean_xmss[2..].to_vec(), vec![(
