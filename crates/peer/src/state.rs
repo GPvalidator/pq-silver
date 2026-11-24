@@ -96,6 +96,7 @@ pub(crate) struct PeerState {
     /// keeps `manage_peers` from re-selecting it while the flush + shutdown
     /// completes.
     pub goodbye_sent: bool,
+    pub late_attestations: u64,
 
     // Graylisted but kept for data-column coverage; dedups the spare log.
     pub evict_spared: bool,
@@ -138,6 +139,7 @@ impl Default for PeerState {
             score_valid_at: now,
             last_breakdown: ScoreBreakdown::default(),
             goodbye_sent: false,
+            late_attestations: 0,
             evict_spared: false,
             is_trusted: false,
         }
@@ -179,6 +181,7 @@ impl PeerState {
         self.cached_score = 0.0;
         self.last_breakdown = ScoreBreakdown::default();
         self.goodbye_sent = false;
+        self.late_attestations = 0;
         self.evict_spared = false;
         self.is_trusted = false;
     }
@@ -198,6 +201,7 @@ impl PeerState {
             p6_ip_colocation: b.p6_ip_colocation,
             p7_behaviour: b.p7_behaviour,
             total: b.total,
+            late_attestations: self.late_attestations,
         }
     }
 

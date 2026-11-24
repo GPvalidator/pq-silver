@@ -735,6 +735,15 @@ impl BeaconStateTile {
             let feedback = match p {
                 PreparedPqVote::Attestation(p) => {
                     let target = p.checked.target;
+                    let half_slot_ms = self.ticker.slot_duration().as_millis() as u64 / 2;
+                    let slot_start_ms =
+                        self.ticker.slot_start(target.attestation_slot).as_millis_u64();
+                    let late = self.ticker.millis_since_genesis() > slot_start_ms + half_slot_ms;
+                    if late && m.stream_id != LOCAL_GOSSIP_STREAM_ID {
+                        silver_log::info!(?m.stream_id, subnet=p.subnet, pubkey=hex32(&p.pubkey), "late attestation");
+                        let p2p_peer = m.stream_id.peer();
+                        producers.produce(PeerEvent::LateAttestation { p2p_peer });
+                    }
                     let feedback = self.commit_pq_attestation(p);
                     if m.stream_id == LOCAL_GOSSIP_STREAM_ID && feedback == Feedback::Accept {
                         producers.produce(BeaconStateEvent::LocalAttestation {

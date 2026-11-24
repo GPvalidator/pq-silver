@@ -308,6 +308,12 @@ impl PeerManager {
         }
     }
 
+    pub(super) fn add_late_attestation(&mut self, conn: usize) {
+        if let Some(peer) = self.peers.get_mut(&conn) {
+            peer.late_attestations += 1;
+        }
+    }
+
     /// No log: a flood would write one line per message.
     pub(super) fn add_out_of_range_delivery(&mut self, conn: usize) {
         if let Some(peer) = self.peers.get_mut(&conn) {
@@ -2372,6 +2378,22 @@ mod tests {
         assert!(mgr.score(1).is_some_and(|score| score >= 0.0), "below the threshold");
         deliver(&mut mgr, 9000, Duration::from_millis(200));
         assert!(mgr.score(1).is_none(), "graylisted and gone");
+    }
+
+    #[test]
+    fn late_attestations_are_counted_per_peer_and_cost_no_score() {
+        let now = Instant::now();
+        let (mut mgr, mut cap) = fixture(vec![], ScoreParams::default());
+        connect(&mut mgr, &mut cap, 1, 1, now);
+        connect(&mut mgr, &mut cap, 2, 2, now);
+        let before = mgr.score(1);
+        for _ in 0..3 {
+            let event = PeerEvent::LateAttestation { p2p_peer: 1 };
+            mgr.handle_event(event, now, &mut |c| cap.0.push(c));
+        }
+        let late = |mgr: &PeerManager, conn| mgr.peers[&conn].scores(0).late_attestations;
+        assert_eq!((late(&mgr, 1), late(&mgr, 2)), (3, 0));
+        assert_eq!(mgr.score(1), before);
     }
 
     #[test]

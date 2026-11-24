@@ -797,6 +797,11 @@ pub enum PeerEvent {
         topic: GossipTopic,
         hash: MessageId,
     },
+    /// A valid single attestation from the peer arrived in the second half
+    /// of the slot it votes in, or later.
+    LateAttestation {
+        p2p_peer: usize,
+    },
     /// Ignored for a slot outside the topic's propagation window.
     P2pGossipOutOfRange {
         p2p_peer: usize,
@@ -2052,4 +2057,6 @@ pub struct PeerScores {
     pub p6_ip_colocation: f64,
     pub p7_behaviour: f64,
     pub total: f64,
+    /// Since the peer connected. Not part of the score.
+    pub late_attestations: u64,
 }

@@ -10,10 +10,13 @@ use ratatui::{
 use crate::{app::App, sources::peers::PeerRow};
 
 const NET_COLS: usize = 11;
-pub const COLUMNS: [&str; 21] = [
+pub const COLUMNS: [&str; 22] = [
     "conn", "peer", "addr", "age", "rtt", "lost", "rxb", "txb", "rxdg", "txdg", "strm", "mesh",
-    "p1", "p2", "p3", "p3b", "p4", "p5", "p6", "p7", "total",
+    "p1", "p2", "p3", "p3b", "p4", "p5", "p6", "p7", "total", "late",
 ];
+/// Single attestations from the peer that arrived in the second half of
+/// their slot, or later.
+const LATE_COL: usize = 21;
 
 const SCORE_COLOR: Color = Color::Magenta;
 
@@ -48,7 +51,8 @@ fn sort_key(row: &PeerRow, col: usize) -> Key {
         })
     } else {
         let Some(s) = &row.scores else {
-            return if col == NET_COLS { Key::Int(0) } else { Key::Float(0.0) };
+            let counted = col == NET_COLS || col == LATE_COL;
+            return if counted { Key::Int(0) } else { Key::Float(0.0) };
         };
         match col {
             11 => Key::Int(s.mesh_count as u128),
@@ -60,6 +64,7 @@ fn sort_key(row: &PeerRow, col: usize) -> Key {
             17 => Key::Float(s.p5_application),
             18 => Key::Float(s.p6_ip_colocation),
             19 => Key::Float(s.p7_behaviour),
+            LATE_COL => Key::Int(s.late_attestations as u128),
             _ => Key::Float(s.total),
         }
     }
@@ -173,6 +178,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     score_cell(s.p6_ip_colocation),
                     score_cell(s.p7_behaviour),
                     score_cell(s.total),
+                    Cell::from(format!("{}", s.late_attestations)),
                 ]),
                 None => cells.extend(
                     (NET_COLS..COLUMNS.len())

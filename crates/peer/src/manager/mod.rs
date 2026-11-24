@@ -468,6 +468,7 @@ impl PeerManager {
                 GossipFlowCounters::rejected(topic);
                 self.add_invalid_delivery(p2p_peer, topic);
             }
+            PeerEvent::LateAttestation { p2p_peer } => self.add_late_attestation(p2p_peer),
             PeerEvent::P2pGossipOutOfRange { p2p_peer, topic: _ } => {
                 crate::PeerCounters::GossipOutOfRange.inc();
                 self.add_out_of_range_delivery(p2p_peer);

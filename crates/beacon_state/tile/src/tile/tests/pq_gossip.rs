@@ -219,6 +219,39 @@ fn accepted_local_vote_is_announced_with_its_slot_and_block() {
     assert_eq!(announced, [(local_slot, root)], "only the local vote");
 }
 
+/// A vote counts against the peer that delivered it once half of its slot
+/// has passed. A local vote has no peer.
+#[test]
+fn vote_past_half_of_its_slot_is_reported_late_for_its_peer() {
+    let key = SecretKey::new(&[7; 32]);
+    let late_events = |ms_into_slot: u64, local: bool| {
+        let (mut tile, mut gossip, _spine, mut adapter) = pq_tile(&key.public_key(), 0, 31);
+        adapter.consume(|_: PeerEvent, _| {});
+        let root = tile.head_block_root();
+        let (bytes, subnet) = signed_attestation(&tile, &key, 0, 0, root);
+        let slot = SingleAttestationPqView::data(&bytes).slot();
+        tile.ticker.set_since_genesis_ms(slot * 12_000 + ms_into_slot);
+        let mut msg =
+            pq_gossip_msg(&tile, &mut gossip, &bytes, GossipTopic::BeaconAttestation(subnet));
+        if local {
+            msg.stream_id = LOCAL_GOSSIP_STREAM_ID;
+        }
+        let peer = msg.stream_id.peer();
+        tile.on_gossip(msg, &mut adapter.producers);
+        tile.flush_votes(&mut adapter.producers);
+        let mut late = Vec::new();
+        adapter.consume(|event: PeerEvent, _| {
+            if let PeerEvent::LateAttestation { p2p_peer } = event {
+                late.push(p2p_peer == peer);
+            }
+        });
+        late
+    };
+    assert!(late_events(6_000, false).is_empty(), "half a slot in is still on time");
+    assert_eq!(late_events(6_001, false), [true]);
+    assert!(late_events(6_001, true).is_empty(), "a local vote");
+}
+
 #[test]
 fn payload_attestation_is_accepted_only_at_its_own_leaf() {
     let key = SecretKey::new(&[7; 32]);
