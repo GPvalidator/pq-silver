@@ -2457,6 +2457,32 @@ impl BeaconStateTile {
         }
     }
 
+    /// Whether a block on the chain of `state_id` packs a vote for `data`: its
+    /// target is on that chain and its source is the justified checkpoint. A
+    /// state before the target epoch cannot tell the source, so only the
+    /// target is checked.
+    fn packs_on_chain(&self, state_id: StateId, data: AttestationDataView) -> bool {
+        let view = self.state.read_view(state_id);
+        let slot_state = view.slot.state();
+        let target_slot = data.target_epoch() * SLOTS_PER_EPOCH;
+        let chain_root = if target_slot < slot_state.slot {
+            view.block_roots.at_slot(target_slot)
+        } else {
+            slot_state.latest_block_root
+        };
+        if *data.target_root() != chain_root {
+            return false;
+        }
+        let epoch = view.epoch.state();
+        let justified = match (slot_state.slot / SLOTS_PER_EPOCH).checked_sub(data.target_epoch()) {
+            Some(0) => epoch.current_justified_checkpoint,
+            Some(1) => epoch.previous_justified_checkpoint,
+            Some(_) => return false,
+            None => return true,
+        };
+        data.source_epoch() == justified.epoch && *data.source_root() == justified.root
+    }
+
     fn send_pq_aggregate_proof(
         &mut self,
         signed: &[u8],
@@ -2474,6 +2500,9 @@ impl BeaconStateTile {
         };
 
         let data = SignedAggregateAndProofPqView::agg_data(signed);
+        // One proof covers a block's attestations, so a vote the block may
+        // not pack would cost it all of them.
+        let merges = merges && self.packs_on_chain(state_id, data);
         let view = self.state.read_view(state_id);
         let domain = Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data);
         let (_, message) = self.attestation_root_memo.roots(data.as_bytes(), &domain);

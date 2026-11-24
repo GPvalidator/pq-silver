@@ -26,9 +26,10 @@ pub struct ChainOverrides {
 /// Where the node takes the state it boots on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootSource {
-    /// A state file, booted from on every start: `checkpoint_file`, else a
-    /// devnet's `genesis.ssz`.
+    /// `checkpoint_file`: a state file, booted from on every start.
     File { ssz: PathBuf, pubkeys: Option<PathBuf> },
+    /// A devnet's `genesis.ssz`, until a checkpoint is persisted.
+    Genesis(PathBuf),
     /// The persisted checkpoint, downloaded from these Beacon API bases (e.g.
     /// checkpointz instances) when missing or far behind.
     Providers(Vec<String>),

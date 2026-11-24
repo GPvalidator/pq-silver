@@ -32,6 +32,10 @@ impl BootCheckpoint {
         let data_dir = &chain_config.data_dir;
         match &chain_config.boot {
             BootSource::File { ssz, pubkeys } => Self::from_file(ssz, pubkeys.as_deref()),
+            BootSource::Genesis(ssz) => match latest_local_checkpoint(data_dir) {
+                None => Self::from_file(ssz, None),
+                local => Self::persisted(local, data_dir),
+            },
             BootSource::Providers(urls) => {
                 let local = latest_local_checkpoint(data_dir);
                 let local_head =
@@ -178,6 +182,33 @@ mod tests {
         let chain_config =
             Config::load(toml.to_str(), Overrides::default()).unwrap().chain().unwrap();
         BootCheckpoint::load(&chain_config)
+    }
+
+    #[test]
+    fn devnet_boots_from_genesis_until_a_checkpoint_is_persisted() {
+        const VALIDATORS_ROOT: [u8; 32] = [0xab; 32];
+        let state =
+            |genesis_time: u64| [&genesis_time.to_le_bytes()[..], &VALIDATORS_ROOT].concat();
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "GENESIS_FORK_VERSION: 0x10000038\n")
+            .unwrap();
+        std::fs::write(dir.path().join("bootstrap_nodes.yaml"), "[]\n").unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state(1)).unwrap();
+        let data_dir = dir.path().join("data");
+        let toml = dir.path().join("silver.toml");
+        std::fs::write(&toml, format!("data_storage_dir = \"{}\"\n", data_dir.display())).unwrap();
+        let boot = || {
+            let network = Some(Network::Devnet(dir.path().to_owned()));
+            let overrides = Overrides { network, ..Overrides::default() };
+            let chain_config = Config::load(toml.to_str(), overrides).unwrap().chain().unwrap();
+            BootCheckpoint::load(&chain_config).unwrap()
+        };
+        assert_eq!(boot().ssz(), state(1), "nothing persisted: genesis");
+
+        let persisted = data_dir.join("finalized_checkpoints/64");
+        std::fs::create_dir_all(&persisted).unwrap();
+        std::fs::write(persisted.join("64.ssz"), state(2)).unwrap();
+        assert_eq!(boot().ssz(), state(2));
     }
 
     #[test]

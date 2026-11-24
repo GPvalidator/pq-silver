@@ -178,7 +178,7 @@ impl Network {
             Self::Hoodi => &HOODI_CHECKPOINT_SYNC_URLS,
             Self::Sepolia => &SEPOLIA_CHECKPOINT_SYNC_URLS,
             Self::Devnet(dir) => {
-                return Ok(BootSource::File { ssz: dir.join("genesis.ssz"), pubkeys: None });
+                return Ok(BootSource::Genesis(dir.join("genesis.ssz")));
             }
         };
         Ok(BootSource::Providers(urls.iter().map(|url| url.to_string()).collect()))

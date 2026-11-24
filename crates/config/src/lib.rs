@@ -894,10 +894,7 @@ mod tests {
         let chain = cfg.chain().unwrap();
         assert_eq!(chain.spec.seconds_per_slot(), 6);
         assert_eq!(chain.bootstrap_enrs.len(), 1);
-        assert_eq!(chain.boot, BootSource::File {
-            ssz: dir.path().join("genesis.ssz"),
-            pubkeys: None
-        });
+        assert_eq!(chain.boot, BootSource::Genesis(dir.path().join("genesis.ssz")));
         assert!(chain.data_dir.ends_with("/devnet-abababab"), "named after the genesis root");
     }
 }

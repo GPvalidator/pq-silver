@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let boot_checkpoint = BootCheckpoint::load(&chain_config)
         .inspect_err(|e| silver_log::error!(%e, "no boot checkpoint"))?;
     let booting_from_local_checkpoint = !boot_checkpoint.is_empty();
-    silver_log::info!("booting from local checkpoint: {booting_from_local_checkpoint}");
+    silver_log::info!("boot state loaded: {booting_from_local_checkpoint}");
 
     let genesis = Genesis::from_state(boot_checkpoint.ssz())?;
 

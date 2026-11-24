@@ -306,6 +306,9 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
 }
 
 const AGGREGATE_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
+/// In a `SignedAggregateAndProof`: its message, the aggregate's offset, then
+/// the attestation data.
+const SOURCE_ROOT_AT: usize = SIGNED_PQ_FIXED + 16 + 4 + 56;
 
 struct PqAggregate {
     signed: Vec<u8>,
@@ -321,10 +324,20 @@ impl PqAggregate {
 
     /// The first `votes` positions of committee zero, or all it has.
     fn of_committee_zero_votes(tile: &mut BeaconStateTile, votes: usize) -> Self {
-        let anchor = tile.last_applied;
-        let state_id = tile.epoch_start_state(anchor, AGGREGATE_SLOT);
+        let stub = tile.last_applied;
+        let state_id = tile.epoch_start_state(stub, AGGREGATE_SLOT);
         let view = tile.state.read_view(state_id);
         let root = ShufflingId::from_state(&view, 2).unwrap().dependent_root;
+        // The anchor as an import leaves it: its header's root is its latest
+        // block root.
+        let anchor = {
+            let mut state = tile.state.write();
+            let mut slot_state = state.slot_states.roll_from(stub.slot_idx);
+            slot_state.state_mut().latest_block_root = root;
+            StateId { slot_idx: slot_state.commit(), ..stub }
+        };
+        let state_id = tile.epoch_start_state(anchor, AGGREGATE_SLOT);
+        let view = tile.state.read_view(state_id);
         let checkpoint = Checkpoint { epoch: 0, root };
         tile.fork_choice = ForkChoice::init(
             checkpoint,
@@ -348,6 +361,7 @@ impl PqAggregate {
         let mut data = [0u8; 128];
         data[..8].copy_from_slice(&AGGREGATE_SLOT.to_le_bytes());
         data[16..48].copy_from_slice(&root);
+        data[56..88].copy_from_slice(&ANCHOR_ROOT);
         data[88..96].copy_from_slice(&epoch.to_le_bytes());
         data[96..].copy_from_slice(&root);
         let votes = votes.min(committee_len);
@@ -382,14 +396,17 @@ impl PqAggregate {
 /// A proven aggregate goes to the leanVM sidecar again, as a merge, only
 /// when a validator registered here proposes the first block to include it.
 #[test]
-fn proven_aggregate_is_merged_for_a_local_proposal() {
+fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
     let key = SecretKey::new(&[7; 32]);
-    for local in [false, true] {
+    for (local, justified_source) in [(false, true), (true, true), (true, false)] {
         let (mut tile, mut gossip, _spine, mut adapter) =
             pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
         adapter.consume(|_: LeanVmReq, _| {});
         // Every validator shares one key, so two votes would be one claim.
         let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
+        if !justified_source {
+            aggregate.signed[SOURCE_ROOT_AT] ^= 1;
+        }
         aggregate.sign(&key, LeafOffset::AggregateAndProof);
         // The proposer lookahead of the anchor state ends before the block.
         tile.last_applied = tile.epoch_start_state(tile.last_applied, AGGREGATE_SLOT);
@@ -415,7 +432,7 @@ fn proven_aggregate_is_merged_for_a_local_proposal() {
         tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
         let mut merges = 0;
         adapter.consume(|_: LeanVmReq, _| merges += 1);
-        assert_eq!(merges, usize::from(local));
+        assert_eq!(merges, usize::from(local && justified_source));
     }
 }
 
@@ -453,8 +470,7 @@ fn aggregate_counts_only_once_signed_and_proven() {
         assert_eq!(voted_weight(&mut tile, aggregate.block_root), weight);
     }
 
-    let source_root = SIGNED_PQ_FIXED + 16 + 4 + 56;
-    aggregate.signed[source_root] ^= 1;
+    aggregate.signed[SOURCE_ROOT_AT] ^= 1;
     aggregate.sign(&key, LeafOffset::AggregateAndProof);
     let second = send(&mut tile, &mut adapter, &aggregate.signed);
     assert_eq!(second, (None, (0, 0)), "aggregator already seen");
