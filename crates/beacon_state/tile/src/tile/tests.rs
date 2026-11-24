@@ -139,12 +139,14 @@ fn make_tile_at_wall_slot_ws(wall_slot: u64, verify_weak_subjectivity: bool) -> 
     let engine_p = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
     let delivery_p = TCache::producer(TCacheId::StorageDelivery, 1 << 20);
     let columns_p = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+    let leanvm_p = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
     let mut tile = BeaconStateTile::new(
         ticker,
         Arc::new(SpecConfig::mainnet()),
         &SyncingConfig::default(),
         TCacheTable::from_iter(
-            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p].map(|p| p.cache_ref()),
+            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p, &leanvm_p]
+                .map(|p| p.cache_ref()),
         ),
         TCache::producer(TCacheId::BeaconStateHandoff, 1 << 20),
         verify_weak_subjectivity,
@@ -182,12 +184,14 @@ fn make_tile_with_producers(
     let engine_p = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
     let delivery_p = TCache::producer(TCacheId::StorageDelivery, 1 << 20);
     let columns_p = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+    let leanvm_p = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
     let mut tile = BeaconStateTile::new(
         ticker,
         Arc::new(spec),
         &SyncingConfig::default(),
         TCacheTable::from_iter(
-            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p].map(|p| p.cache_ref()),
+            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p, &leanvm_p]
+                .map(|p| p.cache_ref()),
         ),
         TCache::producer(TCacheId::BeaconStateHandoff, 1 << 20),
         true,

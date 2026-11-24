@@ -287,6 +287,7 @@ impl Harness {
         let engine_resp_producer = TCache::producer(TCacheId::BoundaryProcessing, 1 << 24);
         let replay_in_producer = TCache::producer(TCacheId::StorageDelivery, 1 << 24);
         let columns_producer = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+        let leanvm_producer = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
         let tcaches = TCacheTable::from_iter(
             [
                 &gossip_in_producer,
@@ -294,6 +295,7 @@ impl Harness {
                 &engine_resp_producer,
                 &replay_in_producer,
                 &columns_producer,
+                &leanvm_producer,
             ]
             .map(|p| p.cache_ref()),
         );
