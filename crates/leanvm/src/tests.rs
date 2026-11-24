@@ -12,7 +12,10 @@ use silver_common::{
 };
 
 use super::LeanVmTile;
-use crate::wire::{Request, tests::encode_request};
+use crate::wire::{
+    Request,
+    tests::{encode_request, encode_verify},
+};
 
 struct Injector;
 impl Tile<SilverSpine> for Injector {
@@ -129,15 +132,6 @@ fn proven(response: &[u8]) -> (AggregateClaims, Vec<u8>) {
     (AggregateClaims::from_bytes(claims).unwrap(), proof.to_vec())
 }
 
-fn verify_body(claims: &AggregateClaims, proof: &[u8]) -> Vec<u8> {
-    let mut body = vec![2];
-    for field in [&claims.to_bytes()[..], proof] {
-        body.extend((field.len() as u64).to_le_bytes());
-        body.extend(field);
-    }
-    body
-}
-
 /// Four keys sign one message; the tile proves, then judges the proof
 /// against its claims and against one claim short, with verifies beside a
 /// second proof.
@@ -177,8 +171,8 @@ fn the_tile_proves_and_verifies_as_the_sidecar_did() {
     );
     let mut fewer = claims.clone();
     fewer.lean_xmss.pop();
-    rig.request(3, &verify_body(&claims, &proof));
-    rig.request(4, &verify_body(&fewer, &proof));
+    rig.request(3, &encode_verify(&claims, &proof));
+    rig.request(4, &encode_verify(&fewer, &proof));
     assert_eq!(rig.answer(3), Some(vec![0, 1]));
     assert_eq!(rig.answer(4), Some(vec![0, 0]));
     let (union, _) = proven(&rig.answer(2).expect("a response"));

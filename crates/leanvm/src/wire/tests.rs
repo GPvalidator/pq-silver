@@ -37,6 +37,13 @@ pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     out
 }
 
+pub(crate) fn encode_verify(claims: &AggregateClaims, proof: &[u8]) -> Vec<u8> {
+    let mut out = vec![OP_VERIFY];
+    put_bytes(&mut out, &claims.to_bytes());
+    put_bytes(&mut out, proof);
+    out
+}
+
 fn request() -> Request<'static> {
     let xmss = (
         LeanXmssPublicKey::from_bytes(&[1; lean_xmss::PUB_KEY_SIZE]),
@@ -101,9 +108,7 @@ fn counts_past_the_body_or_the_bounds_are_refused() {
 #[test]
 fn a_verify_request_decodes() {
     let claims = request().output.unwrap();
-    let mut bytes = vec![OP_VERIFY];
-    put_bytes(&mut bytes, &claims.to_bytes());
-    put_bytes(&mut bytes, &[9, 9]);
+    let bytes = encode_verify(&claims, &[9, 9]);
     assert!(is_verify(&bytes));
     let decoded = decode_verify(&bytes).expect("a verify request");
     assert_eq!(decoded, (claims, &[9, 9][..]));

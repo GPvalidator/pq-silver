@@ -87,7 +87,7 @@ impl Tile<SilverSpine> for LeanVmTile {
         self.intake(adapter);
         if let Some((request_id, body)) = self.aggregates.pop_front() {
             let response = prove(&body);
-            self.answer(request_id, Some(&response));
+            self.answer(request_id, &response);
             adapter.mark_work();
         }
         self.publish(adapter);
@@ -144,19 +144,15 @@ impl LeanVmTile {
     fn collect_verdicts(&mut self) {
         while let Some((request_id, response)) = self.prover.verifier().and_then(Verifier::try_recv)
         {
-            self.answer(request_id, Some(&response));
+            self.answer(request_id, &response);
         }
     }
 
-    fn answer(&mut self, request_id: u64, response: Option<&[u8]>) {
-        let body = response.and_then(|response| {
-            let body =
-                self.producer.write_with(response.len(), |out| out.copy_from_slice(response));
-            if body.is_none() {
-                silver_log::error!(request_id, "leanvm tcache full; response dropped");
-            }
-            body
-        });
+    fn answer(&mut self, request_id: u64, response: &[u8]) {
+        let body = self.producer.write_with(response.len(), |out| out.copy_from_slice(response));
+        if body.is_none() {
+            silver_log::error!(request_id, "leanvm tcache full; response dropped");
+        }
         self.answers.push(LeanVmResp { request_id, body });
     }
 
