@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub(crate) fn post_attestations(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
+    silver_log::info!("attestation: received signed attestations");
     post_submission::<SubmittedAttestation>(req, ctx, resp);
 }
 

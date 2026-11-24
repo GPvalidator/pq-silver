@@ -340,7 +340,7 @@ impl PendingQuery {
                 let block = Some(ServedBlock {
                     slot: unit.slot(),
                     root,
-                    finalized: matches!(unit, QueryUnit::Block { .. }),
+                    finalized: matches!(unit, QueryUnit::Block { .. } | QueryUnit::Envelope { .. }),
                     canonical,
                     ssz: Some(ssz),
                 });
@@ -926,6 +926,22 @@ impl Store {
         let source = RequestSource::Api { request_id, root, canonical };
         let units = located.map(|l| l.file).into_iter().collect();
         self.query_queue.push_back(PendingQuery::new(source, units));
+    }
+
+    /// Answers with no bytes when the block has no stored envelope.
+    pub(super) fn queue_envelope_request(&mut self, request_id: u64, lookup: BlockLookup) {
+        let located = self.lookup(lookup);
+        let (root, canonical) = located.map_or(([0u8; 32], false), |l| (l.root, l.canonical));
+        let source = RequestSource::Api { request_id, root, canonical };
+        let envelope = located.and_then(|l| match l.file {
+            QueryUnit::Block { slot } => Some(QueryUnit::Envelope { slot }),
+            QueryUnit::UnfinalizedBlock { block_root, .. } => self
+                .unfinalized_envelopes
+                .slot_of(&block_root)
+                .map(|slot| QueryUnit::UnfinalizedEnvelope { slot, block_root }),
+            _ => None,
+        });
+        self.query_queue.push_back(PendingQuery::new(source, envelope.into_iter().collect()));
     }
 
     pub(super) fn block_facts(&self, lookup: BlockLookup) -> Option<ServedBlock> {

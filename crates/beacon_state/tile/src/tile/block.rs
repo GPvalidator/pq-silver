@@ -566,6 +566,7 @@ impl BeaconStateTile {
                     block = hex32(&block_root),
                     "leanVM rejected the block's STARK proofs"
                 );
+                self.pq_aggregator.on_block_settled(block.parsed.header.slot, &self.ticker);
                 self.stf_scratch.votes.recycle(block.applied.votes);
                 let source = block.source;
                 producers.produce(BeaconStateEvent::BlockRejected { block_root, source });
@@ -575,6 +576,7 @@ impl BeaconStateTile {
                     block = hex32(&block.parsed.block_root),
                     "leanVM did not judge the block's STARK proofs; dropped"
                 );
+                self.pq_aggregator.on_block_settled(block.parsed.header.slot, &self.ticker);
                 self.stf_scratch.votes.recycle(block.applied.votes);
             }
         }
@@ -727,6 +729,7 @@ impl BeaconStateTile {
             votes,
         } = applied;
 
+        self.pq_aggregator.on_block_settled(parsed.header.slot, &self.ticker);
         let is_gloas = parsed.fork.post_gloas_fork();
         let (parent_payload_status, bid_block_hash, payload_verified) = if is_gloas {
             (parsed.parent_payload_status, bid_block_hash, false)

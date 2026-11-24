@@ -18,7 +18,7 @@ use silver_common::{
 };
 use silver_crypto_simd::xmss::SecretKey;
 use silver_slashing::Selection;
-use silver_ssz::ssz_view::AttestationPqView;
+use silver_ssz::ssz_view::{AttestationPqView, SingleAttestationPqView};
 
 use super::*;
 use crate::tile::leanvm_verifier::ProofVerdict;
@@ -187,6 +187,36 @@ fn batched_votes_count_only_when_signed_at_their_leaf() {
     assert_eq!(gossip_verdicts(&mut adapter), (1, 1));
     assert!(tile.seen_attesters.contains(0, 0) && !tile.seen_attesters.contains(0, 1));
     assert_eq!(voted_weight(&mut tile, root), MAX_EFFECTIVE_BALANCE);
+}
+
+#[test]
+fn accepted_local_vote_is_announced_with_its_slot_and_block() {
+    let key = SecretKey::new(&[7; 32]);
+    let (mut tile, mut gossip, mut spine, mut adapter) = pq_tile(&key.public_key(), 0, 31);
+    let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
+    sink.consume(|_: BeaconStateEvent, _| {});
+    let root = tile.head_block_root();
+
+    let mut local_slot = 0;
+    for (validator, local) in [(0, false), (1, true)] {
+        let (bytes, subnet) = signed_attestation(&tile, &key, validator, 0, root);
+        let topic = GossipTopic::BeaconAttestation(subnet);
+        let mut msg = pq_gossip_msg(&tile, &mut gossip, &bytes, topic);
+        if local {
+            msg.stream_id = LOCAL_GOSSIP_STREAM_ID;
+            local_slot = SingleAttestationPqView::data(&bytes).slot();
+        }
+        tile.on_gossip(msg, &mut adapter.producers);
+    }
+    tile.flush_votes(&mut adapter.producers);
+
+    let mut announced = Vec::new();
+    sink.consume(|event: BeaconStateEvent, _| {
+        if let BeaconStateEvent::LocalAttestation { slot, block_root } = event {
+            announced.push((slot, block_root));
+        }
+    });
+    assert_eq!(announced, [(local_slot, root)], "only the local vote");
 }
 
 #[test]

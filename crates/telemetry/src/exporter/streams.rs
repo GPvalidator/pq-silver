@@ -142,6 +142,7 @@ pub(super) fn stage_record(e: &StageEvent) -> StageRecord {
         Stage::CustodyDone => (StageCode::CustodyDone, 0, None),
         Stage::StfDone => (StageCode::StfDone, 0, None),
         Stage::Attestable => (StageCode::Attestable, 0, None),
+        Stage::LocalAttestation => (StageCode::LocalAttestation, 0, None),
     };
     StageRecord {
         block_root: e.block_root,

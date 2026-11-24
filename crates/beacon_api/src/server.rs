@@ -6,7 +6,9 @@ use std::{
 };
 
 use mio::{Events, Interest, Registry, Token, event::Event};
-use silver_beacon_state_data::{B256, BeaconStateReader, SpecConfig};
+use silver_beacon_state_data::{
+    B256, BeaconStateReader, SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, SpecConfig,
+};
 use silver_common::{
     BeaconApiRequest, BeaconApiResponse, BeaconStateEvent, BlockStage, DataColumnsEvent,
     ELSyncStatus, EngineResp, Enr, ForkName, GossipTopic, HeadChange, Identify, Keypair,
@@ -798,7 +800,13 @@ impl BeaconApi {
                 self.ctx.node_status.build_on_full = build_on_full;
                 self.ctx.node_status.wall_slot = wall_slot;
                 self.ctx.proposer_preferences.on_slot(wall_slot);
-                self.ctx.node_status.finalized_epoch = StatusView::finalized_epoch(&ssz);
+                let finalized_epoch = StatusView::finalized_epoch(&ssz);
+                let finalized = finalized_epoch > self.ctx.node_status.finalized_epoch;
+                self.ctx.node_status.finalized_epoch = finalized_epoch;
+                if finalized {
+                    let block_root = StatusView::finalized_root(&ssz);
+                    self.publish_finalized_checkpoint(finalized_epoch, block_root, optimistic);
+                }
                 if head_change == HeadChange::None || !self.ctx.node_status.is_following() {
                     return;
                 }
@@ -1089,6 +1097,24 @@ impl BeaconApi {
     /// notifications are not deduplicated.
     pub fn publish_block(&mut self, slot: u64, block_root: &[u8; 32]) {
         self.publish(Channel::Block, "block", |json| json.block_event(slot, block_root, true));
+    }
+
+    /// `state` is the head chain's state root at the epoch's first slot.
+    fn publish_finalized_checkpoint(
+        &mut self,
+        epoch: u64,
+        block_root: &B256,
+        execution_optimistic: bool,
+    ) {
+        let channel = Channel::FinalizedCheckpoint;
+        if !self.ctx.node_status.is_following() || !self.has_subscriber(channel) {
+            return;
+        }
+        let at = (epoch * SLOTS_PER_EPOCH) as usize % SLOTS_PER_HISTORICAL_ROOT;
+        let state_root = self.ctx.read_state(|view| view.state_roots.get(at));
+        self.publish(channel, "finalized_checkpoint", |json| {
+            json.finalized_checkpoint_event(block_root, &state_root, epoch, execution_optimistic)
+        });
     }
 
     fn publish_head(&mut self, head: &HeadEvent) {
@@ -2675,6 +2701,36 @@ mod tests {
     }
 
     #[test]
+    fn finalized_checkpoint_is_emitted_once_per_newly_finalized_epoch() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        let finalized = |slot, epoch: u64| {
+            let mut event = status(slot, 0xab, false);
+            if let BeaconStateEvent::Status { ssz, .. } = &mut event {
+                ssz[4..36].fill(0xf1);
+                ssz[36..44].copy_from_slice(&epoch.to_le_bytes());
+            }
+            event
+        };
+        let mut client = connect(tcp_addr(&server));
+        subscribe(&mut client, "finalized_checkpoint");
+        let reader = read_events_until_marker(client);
+        pump_until(&mut server, "subscribed", |server| subscribers(server) == 1);
+
+        server.api.handle_beacon_state_event(finalized(95, 0));
+        server.api.handle_beacon_state_event(finalized(96, 1));
+        server.api.handle_beacon_state_event(finalized(97, 1));
+        finish_events(&mut server);
+
+        let events = serve(&mut server, reader, "finalized event and marker");
+        assert_eq!(events.len(), 1, "epoch 0 is not news, and epoch 1 is news once");
+        assert_eq!(events[0].topic, "finalized_checkpoint");
+        let data = &events[0].data;
+        assert_eq!(data["block"], format!("0x{}", "f1".repeat(32)));
+        assert_eq!(data["state"].as_str().map(str::len), Some(2 + 64));
+        assert_eq!((&data["epoch"], &data["execution_optimistic"]), (&"1".into(), &false.into()));
+    }
+
+    #[test]
     fn validated_columns_read_commitments_from_each_source_cache() {
         let mut server = server_with(64, LONG_TIMEOUT);
         let mut sources = [
@@ -3504,6 +3560,7 @@ mod tests {
     fn request_id(request: &BeaconApiRequest) -> u64 {
         match request {
             BeaconApiRequest::Block { request_id, .. } |
+            BeaconApiRequest::BlockEnvelope { request_id, .. } |
             BeaconApiRequest::PublishPayloadEnvelope { request_id, .. } |
             BeaconApiRequest::LocalGossip { request_id, .. } |
             BeaconApiRequest::AggregateAttestation { request_id, .. } |
@@ -4007,6 +4064,70 @@ mod tests {
         );
         assert!(response.starts_with(head.as_bytes()), "{}", String::from_utf8_lossy(&response));
         assert_eq!(body(&response), block);
+    }
+
+    #[test]
+    fn block_is_answered_as_json_to_a_client_that_does_not_accept_ssz() {
+        let mut server = server_with(64, LONG_TIMEOUT);
+        let mut client = connect(tcp_addr(&server));
+        let path = format!("/eth/v2/beacon/blocks/{}", root_hex(0xab));
+        write!(client, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let request_id = request_id(&deferred_request(&mut server));
+
+        server.serve_block(request_id, 10, [0xab; 32], &block_bytes(10, 0xef));
+        let reader = std::thread::spawn(move || read_to_eof(client));
+        let response = serve(&mut server, reader, "json block response");
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nEth-Consensus-Version: ";
+        assert!(response.starts_with(head.as_bytes()), "{}", String::from_utf8_lossy(&response));
+        let parsed: Value = serde_json::from_slice(body(&response)).unwrap();
+        let message = &parsed["data"]["message"];
+        assert_eq!((&message["slot"], &message["proposer_index"]), (&"10".into(), &"7".into()));
+        assert_eq!(message["state_root"], root_hex(0xef));
+        assert!(parsed["version"].is_string() && parsed["finalized"].is_boolean());
+    }
+
+    #[test]
+    fn stored_envelope_of_a_block_is_answered_as_ssz_json_or_404() {
+        use silver_common::test_util::empty_signed_envelope_pq;
+
+        let envelope = empty_signed_envelope_pq(10, [0xab; 32]);
+        let path = format!("/eth/v1/beacon/execution_payload_envelopes/{}", root_hex(0xab));
+        for (accept, stored) in [("application/octet-stream", true), ("*/*", true), ("*/*", false)]
+        {
+            let mut server = server_with(64, LONG_TIMEOUT);
+            let mut client = connect(tcp_addr(&server));
+            write!(
+                client,
+                "GET {path} HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let BeaconApiRequest::BlockEnvelope { request_id, lookup } =
+                deferred_request(&mut server)
+            else {
+                panic!("an envelope request");
+            };
+            assert_eq!(lookup, BlockLookup::Root([0xab; 32]));
+
+            if stored {
+                server.serve_block(request_id, 10, [0xab; 32], &envelope);
+            } else {
+                server.answer(BeaconApiResponse::Block { request_id, block: None });
+            }
+            let reader = std::thread::spawn(move || read_to_eof(client));
+            let response = serve(&mut server, reader, "envelope response");
+            match (stored, accept) {
+                (false, _) => assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n")),
+                (true, "*/*") => {
+                    let parsed: Value = serde_json::from_slice(body(&response)).unwrap();
+                    let message = &parsed["data"]["message"];
+                    assert_eq!(message["beacon_block_root"], root_hex(0xab));
+                    assert!(message["payload"]["transactions"].is_array());
+                    assert!(parsed["data"]["signature"].is_string());
+                    assert!(parsed["version"].is_string() && parsed["finalized"].is_boolean());
+                }
+                (true, _) => assert_eq!(body(&response), envelope),
+            }
+        }
     }
 
     #[test]

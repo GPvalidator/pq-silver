@@ -4,7 +4,9 @@ use silver_beacon_state_data::BeaconBlockHeader;
 use silver_common::{
     BeaconApiRequest, BlockLookup, ServedBlock, TCacheReader,
     json_fields::parse_uint64,
-    ssz_view::{BeaconBlockBodyPqView, SignedBeaconBlockPqView},
+    ssz_view::{
+        BeaconBlockBodyPqView, SignedBeaconBlockPqView, SignedExecutionPayloadEnvelopePqView,
+    },
 };
 
 use crate::{
@@ -20,6 +22,9 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Ssz,
+    Json,
+    EnvelopeSsz,
+    EnvelopeJson,
     Root,
     Header,
     HeaderList,
@@ -33,10 +38,15 @@ pub(crate) struct BlockRequest {
 
 pub(crate) fn block(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
     let Some(lookup) = requested_block(req, ctx, resp) else { return };
-    if !req.accepts_ssz() {
-        return resp.error(406, "only application/octet-stream is served");
-    }
-    resp.defer(Outcome::AwaitingBlock(BlockRequest { lookup, kind: Kind::Ssz }));
+    let kind = if req.accepts_ssz() { Kind::Ssz } else { Kind::Json };
+    resp.defer(Outcome::AwaitingBlock(BlockRequest { lookup, kind }));
+}
+
+/// The block's stored `SignedExecutionPayloadEnvelope`.
+pub(crate) fn block_envelope(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
+    let Some(lookup) = requested_block(req, ctx, resp) else { return };
+    let kind = if req.accepts_ssz() { Kind::EnvelopeSsz } else { Kind::EnvelopeJson };
+    resp.defer(Outcome::AwaitingBlock(BlockRequest { lookup, kind }));
 }
 
 pub(crate) fn block_root(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Response<'_>) {
@@ -91,8 +101,13 @@ fn requested_block(
 
 impl BlockRequest {
     pub(crate) fn storage_request(self, request_id: u64) -> BeaconApiRequest {
-        let with_bytes = self.kind != Kind::Root;
-        BeaconApiRequest::Block { request_id, lookup: self.lookup, with_bytes }
+        let lookup = self.lookup;
+        match self.kind {
+            Kind::EnvelopeSsz | Kind::EnvelopeJson => {
+                BeaconApiRequest::BlockEnvelope { request_id, lookup }
+            }
+            kind => BeaconApiRequest::Block { request_id, lookup, with_bytes: kind != Kind::Root },
+        }
     }
 }
 
@@ -104,9 +119,16 @@ impl Kind {
         reader: &mut TCacheReader,
         ctx: &ApiCtx,
     ) {
+        let envelope = matches!(self, Self::EnvelopeSsz | Self::EnvelopeJson);
         let Some(block) = block else {
-            return resp.error(404, "block not found");
+            let missing =
+                if envelope { "execution payload envelope not found" } else { "block not found" };
+            return resp.error(404, missing);
         };
+        let version = ctx.spec.fork_at_slot(block.slot).name();
+        let versioned = [("Eth-Consensus-Version", version)];
+        let block_fits = SignedBeaconBlockPqView::check_size;
+        let envelope_fits = SignedExecutionPayloadEnvelopePqView::check_canonical;
         let flags = ReadFlags {
             execution_optimistic: ctx.node_status.execution_optimistic(),
             finalized: block.finalized,
@@ -115,11 +137,21 @@ impl Kind {
             Self::Root => resp.json_body(|json| {
                 json.flagged_envelope(flags, |json| json.block_root(&block.root))
             }),
-            Self::Ssz => with_bytes(resp, &block, reader, |resp, bytes| {
-                let version = ctx.spec.fork_at_slot(block.slot).name();
-                resp.send(200, Some(SSZ_MEDIA_TYPE), &[("Eth-Consensus-Version", version)], &[
-                    bytes,
-                ]);
+            Self::Ssz => with_bytes(resp, &block, reader, block_fits, |resp, bytes| {
+                resp.send(200, Some(SSZ_MEDIA_TYPE), &versioned, &[bytes]);
+            }),
+            Self::EnvelopeSsz => with_bytes(resp, &block, reader, envelope_fits, |resp, bytes| {
+                resp.send(200, Some(SSZ_MEDIA_TYPE), &versioned, &[bytes]);
+            }),
+            Self::Json => with_bytes(resp, &block, reader, block_fits, |resp, bytes| {
+                resp.json_with_headers(&versioned, |json| {
+                    json.signed_beacon_block_pq(version, flags, bytes)
+                });
+            }),
+            Self::EnvelopeJson => with_bytes(resp, &block, reader, envelope_fits, |resp, bytes| {
+                resp.json_with_headers(&versioned, |json| {
+                    json.signed_execution_payload_envelope_pq(version, flags, bytes)
+                });
             }),
             Self::Header => with_header(resp, &block, reader, |json, signed| {
                 json.flagged_envelope(flags, |json| json.signed_header(signed))
@@ -137,16 +169,18 @@ fn with_header(
     reader: &mut TCacheReader,
     render: impl FnOnce(&mut Json<'_>, &SignedHeader<'_>),
 ) {
-    with_bytes(resp, block, reader, |resp, bytes| {
+    with_bytes(resp, block, reader, SignedBeaconBlockPqView::check_size, |resp, bytes| {
         let signed = SignedHeader::read(block, bytes);
         resp.json_body(|json| render(json, &signed));
     });
 }
 
+/// `fits` is the layout check of what storage was asked for.
 fn with_bytes(
     resp: &mut Response<'_>,
     block: &ServedBlock,
     reader: &mut TCacheReader,
+    fits: fn(&[u8]) -> bool,
     respond: impl FnOnce(&mut Response<'_>, &[u8]),
 ) {
     let Some(ssz) = block.ssz else {
@@ -155,10 +189,10 @@ fn with_bytes(
     };
     let ssz = reader.acquire(ssz);
     match ssz.buffer() {
-        Ok((bytes, _)) if SignedBeaconBlockPqView::check_size(bytes) => respond(resp, bytes),
+        Ok((bytes, _)) if fits(bytes) => respond(resp, bytes),
         Ok(_) => {
-            silver_log::error!(block.slot, "stored block fits no SignedBeaconBlock layout");
-            resp.error(500, "stored block is malformed");
+            silver_log::error!(block.slot, "stored bytes do not fit the layout asked for");
+            resp.error(500, "stored bytes are malformed");
         }
         Err(e) => {
             silver_log::warn!(?e, block.slot, "served block overwritten before it was read");
@@ -226,12 +260,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_block_body_negotiates_ssz() {
-        for accept in [None, Some("application/json")] {
+    fn block_body_is_json_unless_ssz_is_accepted() {
+        let lookup = BlockLookup::Root(ROOT);
+        for accept in [None, Some("application/json"), Some("*/*")] {
             let [(body, _), (root, _), (header, _)] = routes(&format!("0x{}", "ab".repeat(32)));
-            let (outcome, out) = get(&body, accept);
-            assert_eq!(outcome, Outcome::Response(None));
-            assert!(out.starts_with(b"HTTP/1.1 406 Not Acceptable\r\n"), "{accept:?}");
+            let (outcome, _) = get(&body, accept);
+            let json = BlockRequest { lookup, kind: Kind::Json };
+            assert_eq!(outcome, Outcome::AwaitingBlock(json), "{accept:?}");
             for path in [root, header] {
                 let (outcome, _) = get(&path, accept);
                 assert!(matches!(outcome, Outcome::AwaitingBlock(_)), "{path} {accept:?}");

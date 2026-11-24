@@ -1,7 +1,7 @@
 use crate::{
     beacon::{
         block_submission::{post_blinded_block_v2, post_block_v2},
-        blocks::{block, block_header, block_root, head_headers},
+        blocks::{block, block_envelope, block_header, block_root, head_headers},
         builders::post_state_builders,
         committees::get_epoch_committees,
         operations::{post_attestations, post_attester_slashing, post_proposer_slashing},
@@ -59,6 +59,7 @@ pub(crate) const SERVED_WHILE_SYNCING: &[&str] = &[
 
 pub(crate) const ROUTES: &[(Method, &str, Handler)] = &[
     (Method::Post, "/eth/v1/beacon/execution_payload_envelopes", post_payload_envelope),
+    (Method::Get, "/eth/v1/beacon/execution_payload_envelopes/{block_id}", block_envelope),
     (Method::Get, "/eth/v1/beacon/blocks/{block_id}/root", block_root),
     (Method::Get, "/eth/v1/beacon/genesis", genesis),
     (Method::Get, "/eth/v1/beacon/headers", head_headers),

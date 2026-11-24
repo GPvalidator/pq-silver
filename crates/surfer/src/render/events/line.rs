@@ -271,6 +271,7 @@ fn attributes(trace: &BlockTrace, node: Node) -> String {
             let gate = if trace.da.opened_gate(&batch) { " DA" } else { "" };
             format!("{} cols{gate}", batch.columns.len())
         }
+        Node::Span(Span::LocalVotes) => format!("{} votes", trace.local_votes.count),
         Node::Span(Span::El) => {
             trace.el.status().map_or_else(String::new, |v| status_label(v).to_string())
         }

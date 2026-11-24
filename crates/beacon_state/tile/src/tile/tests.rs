@@ -7813,6 +7813,8 @@ mod pq_aggregator {
             sink.consume(|_: LeanVmReq, _| {});
             sink.consume(|_: BeaconApiResponse, _| {});
             tile.consume_shared(&mut adapter);
+            // The block of `SLOT` came 1 s in, so merges of earlier slots run.
+            tile.pq_aggregator.on_block_settled(SLOT, &tile.ticker);
             Self { tile, gossip, adapter, sink, _spine: spine }
         }
 
@@ -7883,7 +7885,14 @@ mod pq_aggregator {
             self.respond(request.request_id, &[[3; 64]]);
         }
 
+        /// The slot starts and its block is verified at once.
         fn start_slot(&mut self, slot: Slot) {
+            self.start_slot_without_a_block(slot);
+            self.tile.pq_aggregator.on_block_settled(slot, &self.tile.ticker);
+            self.send_next();
+        }
+
+        fn start_slot_without_a_block(&mut self, slot: Slot) {
             let start_ms = self.tile.ticker.slot_start(slot).as_millis_u64();
             self.tile.ticker.set_since_genesis_ms(start_ms);
             self.tile.pq_aggregator.prune_before(slot - 1);
@@ -8002,6 +8011,43 @@ mod pq_aggregator {
         let (attestations, proof) = rig.tile.pq_aggregator.block_proof(SLOT + 1).unwrap();
         assert_eq!(attestations, [attestation_in(SLOT - 1, 0, 0..2)]);
         assert_eq!(proof, b"proof");
+    }
+
+    #[test]
+    fn a_merge_waits_for_the_next_slots_block_until_the_attestation_deadline() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.aggregate(SLOT, &[[1; 64]]);
+        rig.start_slot_without_a_block(SLOT + 1);
+        assert!(rig.requests().is_empty(), "the block may still need the leanVM sidecar");
+
+        let deadline_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64() + 12_000 / 4;
+        rig.tile.ticker.set_since_genesis_ms(deadline_ms - 1);
+        rig.send_next();
+        assert!(rig.requests().is_empty());
+        rig.tile.ticker.set_since_genesis_ms(deadline_ms);
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 1));
+    }
+
+    #[test]
+    fn a_merge_starts_as_soon_as_the_next_slots_block_is_settled() {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.aggregate(SLOT, &[[1; 64]]);
+        rig.start_slot_without_a_block(SLOT + 1);
+        assert!(rig.requests().is_empty());
+
+        rig.tile.pq_aggregator.on_block_settled(SLOT + 1, &rig.tile.ticker);
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 1));
+
+        rig.respond(request.request_id, &[[1; 64]]);
+        rig.aggregate(SLOT, &[[1; 64], [2; 64]]);
+        let late = rig.request();
+        assert!(rig.carries(&late, 2), "an aggregate after the block is merged at once");
     }
 
     #[test]

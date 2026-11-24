@@ -52,9 +52,11 @@ impl<'a> BlockEventRow<'a> {
                 (format!("{origin:?}"), None, Some(index))
             }
             Stage::ElVerdict { verdict } => (String::new(), Some(format!("{verdict:?}")), None),
-            Stage::StfDone | Stage::Attestable | Stage::DaAvailable | Stage::CustodyDone => {
-                (String::new(), None, None)
-            }
+            Stage::StfDone |
+            Stage::Attestable |
+            Stage::DaAvailable |
+            Stage::CustodyDone |
+            Stage::LocalAttestation => (String::new(), None, None),
         };
         Self {
             event_date_time: event.ts.0,

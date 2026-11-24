@@ -34,6 +34,10 @@ pub enum Stage {
     /// In fork choice with the new head published: publish of the
     /// root's first `BlockReceived { stage: Applied }`, ahead of the FCU.
     Attestable,
+    /// A local validator's vote for the block passed gossip validation. The
+    /// event's slot is the vote's, which is later than the block's when the
+    /// vote's own slot had no block.
+    LocalAttestation,
 }
 
 impl Stage {
@@ -48,6 +52,7 @@ impl Stage {
             Self::CustodyDone => "custody_done",
             Self::StfDone => "stf_done",
             Self::Attestable => "attestable",
+            Self::LocalAttestation => "local_attestation",
         }
     }
 }

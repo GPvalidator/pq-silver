@@ -180,6 +180,7 @@ pub enum StageCode {
     CustodyDone = 6,
     StfDone = 7,
     Attestable = 8,
+    LocalAttestation = 9,
 }
 
 /// `detail` by stage: `Received`/`ElSent` block source (0 gossip, 1 rpc);

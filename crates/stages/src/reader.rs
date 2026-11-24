@@ -56,6 +56,15 @@ impl StageReader {
     /// only the first announcement is its arrival; an unparked block's one
     /// announcement carries its arrival, its post-state and its import.
     fn on_beacon_state(&mut self, m: &InternalMessage<BeaconStateEvent>) {
+        if let BeaconStateEvent::LocalAttestation { slot, block_root } = *m.data() {
+            self.out.push(StageEvent {
+                stage: Stage::LocalAttestation,
+                ts: m.tracking_timestamp().publish_t(),
+                block_root,
+                slot: Some(slot),
+            });
+            return;
+        }
         let BeaconStateEvent::BlockReceived { slot, block_root, source, stage, .. } = *m.data()
         else {
             return;
@@ -313,6 +322,18 @@ mod tests {
             let t = find(&reader.out, stage).ts;
             assert!(t > ingested, "{stage} at {t} must follow its ingestion {ingested}");
         }
+    }
+
+    #[test]
+    fn a_local_vote_is_a_stage_of_the_block_it_votes_for() {
+        let mut reader = StageReader::default();
+        let root = [3u8; 32];
+        let vote = BeaconStateEvent::LocalAttestation { slot: 6, block_root: root };
+        reader.on_beacon_state(&msg(vote, at(6, 500)));
+
+        let [event] = reader.out.as_slice() else { panic!("one stage") };
+        assert_eq!(event.stage.name(), "local_attestation");
+        assert_eq!((event.block_root, event.slot), (root, Some(6)));
     }
 
     #[test]

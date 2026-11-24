@@ -29,12 +29,15 @@ impl Group {
 
     pub fn children(self, trace: &BlockTrace) -> &'static [Span] {
         match self {
-            Self::Block if trace.gloas => &[Span::Stf(StfSpan::Root), Span::Payload],
+            Self::Block if trace.gloas => {
+                &[Span::Stf(StfSpan::Root), Span::Payload, Span::LocalVotes]
+            }
             Self::Block => &[
                 Span::Da(DaSpan::Root),
                 Span::Da(DaSpan::Custody),
                 Span::Stf(StfSpan::Root),
                 Span::El,
+                Span::LocalVotes,
             ],
             Self::Payload => &[Span::Da(DaSpan::Root), Span::Da(DaSpan::Custody), Span::El],
             Self::Da => &[
@@ -94,6 +97,7 @@ impl Span {
             Self::Stf(span) => span.spec(),
             Self::El => SpanSpec::new("el", None),
             Self::Payload => SpanSpec::new("payload", Some(Group::Payload)),
+            Self::LocalVotes => SpanSpec::new("local votes", None),
         }
     }
 
@@ -107,6 +111,7 @@ impl Span {
             Self::Da(DaSpan::Custody) => !trace.da.has_columns(),
             Self::Stf(StfSpan::Validate | StfSpan::Apply) => trace.gloas,
             Self::Stf(StfSpan::DaWait) => !trace.stf.parked(),
+            Self::LocalVotes => trace.local_votes.count == 0,
             _ => false,
         }
     }
@@ -214,9 +219,14 @@ impl Node {
         matches!(self, Self::Span(Span::Da(_)))
     }
 
-    /// A blobless block's data component is nothing but the gate opening.
+    /// A blobless block's data component is nothing but the gate opening, and
+    /// one local vote is one moment.
     pub fn is_instant(self, trace: &BlockTrace) -> bool {
-        matches!(self, Self::Span(Span::Da(DaSpan::Root)) if !trace.da.has_columns())
+        match self {
+            Self::Span(Span::Da(DaSpan::Root)) => !trace.da.has_columns(),
+            Self::Span(Span::LocalVotes) => trace.local_votes.count == 1,
+            _ => false,
+        }
     }
 }
 
@@ -334,7 +344,8 @@ mod tests {
 
     use super::*;
     use crate::sources::events::trace_tests::{
-        APPLY, DA, DA_WAIT, STF, VALIDATE, cols, el_sent, gloas_trace, received, trace, valid,
+        APPLY, DA, DA_WAIT, STF, VALIDATE, at, cols, el_sent, event, gloas_trace, received, trace,
+        valid,
     };
 
     fn rows_of(trace: BlockTrace) -> BlockTraces {
@@ -397,6 +408,21 @@ mod tests {
         assert_eq!(display[5].fold, Fold::Leaf, "validate is a leaf");
         assert_eq!(display[7].depth, 1, "el is a component of its own");
         assert_eq!(display[7].fold, Fold::Leaf);
+    }
+
+    #[test]
+    fn local_votes_unfold_under_a_block_that_has_some() {
+        let mut block = with_columns();
+        block.apply(event(Stage::LocalAttestation, at(2, 900), Some(2)));
+        let mut expanded = Expanded::default();
+        expanded.toggle(block.block_root, Group::Block);
+
+        let display = display_rows(&rows_of(block), &expanded);
+        let last = display.last().expect("rows");
+        assert_eq!(
+            (last.node, last.depth, last.fold),
+            (Node::Span(Span::LocalVotes), 1, Fold::Leaf)
+        );
     }
 
     /// A Gloas block's stf has no dispatch to split at, and its data and

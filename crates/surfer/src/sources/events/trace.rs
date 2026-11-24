@@ -42,6 +42,23 @@ pub enum Span {
     Stf(StfSpan),
     El,
     Payload,
+    LocalVotes,
+}
+
+/// Votes of this node's validators for the block, from the first accepted to
+/// the last.
+#[derive(Default)]
+pub struct LocalVotes {
+    pub count: u32,
+    interval: Option<Interval>,
+}
+
+impl LocalVotes {
+    fn accepted(&mut self, at: Nanos) {
+        self.count += 1;
+        let held = self.interval.unwrap_or(Interval { start: at, end: at });
+        self.interval = Some(Interval { start: held.start.min(at), end: held.end.max(at) });
+    }
 }
 
 /// The block's common points — arrival and `newPayload` dispatch, which both
@@ -58,6 +75,7 @@ pub struct BlockTrace {
     pub da: DataAvailability,
     pub stf: StateTransition,
     pub el: Execution,
+    pub local_votes: LocalVotes,
 }
 
 impl BlockTrace {
@@ -72,6 +90,7 @@ impl BlockTrace {
             da: DataAvailability::default(),
             stf: StateTransition::default(),
             el: Execution::default(),
+            local_votes: LocalVotes::default(),
         }
     }
 
@@ -94,6 +113,7 @@ impl BlockTrace {
             Stage::ColumnValidated { index, .. } => self.da.column_validated(index, ts),
             Stage::DaAvailable => self.da.gate_opened(ts),
             Stage::CustodyDone => self.da.custody_completed(ts),
+            Stage::LocalAttestation => self.local_votes.accepted(ts),
         }
     }
 
@@ -161,6 +181,7 @@ impl BlockTrace {
                 self.stf.interval(span, self.validate_from(), self.block_el_sent_at())
             }
             Span::El => self.el.interval(self.el_sent_at),
+            Span::LocalVotes => self.local_votes.interval,
             Span::Payload => {
                 let start = [self.el_sent_at, self.da.first_column_at(), self.da.available()]
                     .into_iter()

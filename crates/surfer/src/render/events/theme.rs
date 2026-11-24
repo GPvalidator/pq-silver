@@ -41,6 +41,7 @@ pub struct Components {
     pub apply: Color,
     pub da_wait: Color,
     pub payload: Color,
+    pub local_votes: Color,
 }
 
 impl Default for Components {
@@ -54,6 +55,7 @@ impl Default for Components {
             apply: Color::Blue,
             da_wait: Color::DarkGray,
             payload: Color::LightGreen,
+            local_votes: Color::LightMagenta,
         }
     }
 }
@@ -71,6 +73,7 @@ impl Components {
             Span::Stf(StfSpan::Apply) => Some(self.apply),
             Span::Stf(StfSpan::DaWait) => Some(self.da_wait),
             Span::Payload => Some(self.payload),
+            Span::LocalVotes => Some(self.local_votes),
             Span::El => None,
         }
     }

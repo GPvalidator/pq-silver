@@ -57,6 +57,10 @@ impl BlockTraces {
             // only while live, so early columns land but backfill's
             // historical-slot events cannot churn the pane.
             None => {
+                // A vote's slot is not its block's, so it cannot place a trace.
+                if matches!(event.stage, Stage::LocalAttestation) {
+                    return;
+                }
                 let Some(slot) = event.slot else {
                     return;
                 };
@@ -178,6 +182,21 @@ mod tests {
         assert_eq!(trace.da.columns[0].index, 48);
         assert_eq!(trace.da.columns[0].interval(), Interval { start: at(4, 200), end: at(4, 210) });
         assert_eq!(strip_start(trace), Some(at(4, 300)));
+    }
+
+    /// A vote joins the trace of the block it votes for, whatever its own
+    /// slot, and opens none.
+    #[test]
+    fn local_votes_join_their_block_and_open_no_trace() {
+        let vote = |ms| event(Stage::LocalAttestation, at(5, ms), Some(5));
+        let traces = fold_all(vec![vote(100), event(received(), at(4, 300), Some(4)), vote(700)]);
+        assert_eq!(traces.len(), 1, "the vote ahead of its block opened no trace");
+        assert_eq!(traces[0].local_votes.count, 1);
+
+        let traces = fold_all(vec![event(received(), at(4, 300), Some(4)), vote(900), vote(700)]);
+        assert_eq!(traces[0].local_votes.count, 2);
+        let votes = traces[0].interval(Span::LocalVotes);
+        assert_eq!(votes, Some(Interval { start: at(5, 700), end: at(5, 900) }));
     }
 
     /// A slotless event (a verdict for a root from before attach) has no

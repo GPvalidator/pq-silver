@@ -1,10 +1,7 @@
 use serde::Deserialize;
 use silver_beacon_state_data::{B256, Checkpoint, Epoch, SLOTS_PER_EPOCH, Slot, StateReadView};
 use silver_common::{
-    PayloadResolution,
-    json_fields::{bytes, parse_uint64, uint64},
-    ssz_hash::hash_attestation_data,
-    ssz_view::{ATTESTATION_DATA_SIZE, AttestationDataView},
+    json_fields::{bytes, parse_uint64, uint64}, ssz_hash::hash_attestation_data, ssz_view::{AttestationDataView, ATTESTATION_DATA_SIZE}, PayloadResolution
 };
 
 use crate::{
@@ -72,7 +69,10 @@ pub(crate) fn attestation_data(req: &Request<'_>, ctx: &ApiCtx, resp: &mut Respo
     match ctx
         .read_state(|view| AttestationData::read(&view, slot, head_root, head_payload, is_gloas))
     {
-        Ok(data) => resp.json_body(|json| json.data_envelope(|json| json.attestation_data(&data))),
+        Ok(data) => {
+            silver_log::info!(slot, ?head_root, "attestation: returning data");
+            resp.json_body(|json| json.data_envelope(|json| json.attestation_data(&data)))
+        }
         Err(Unserved { code, message }) => resp.error(code, message),
     }
 }

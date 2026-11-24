@@ -26,6 +26,7 @@ pub(crate) enum Channel {
     ProposerPreferences,
     ExecutionPayloadAvailable,
     PayloadAttributes,
+    FinalizedCheckpoint,
 }
 
 /// `epoch_transition` compares this head with the publisher's previous
@@ -101,6 +102,7 @@ fn channel(topic: &str) -> Option<Channel> {
         "proposer_preferences" => Some(Channel::ProposerPreferences),
         "payload_attributes" => Some(Channel::PayloadAttributes),
         "execution_payload_available" => Some(Channel::ExecutionPayloadAvailable),
+        "finalized_checkpoint" => Some(Channel::FinalizedCheckpoint),
         _ => None,
     }
 }
@@ -189,8 +191,8 @@ mod tests {
     #[test]
     fn topic_silver_does_not_serve_refuses_the_whole_subscription_by_name() {
         let unknown = |topic: &str| Err(Refused::Unknown(topic.to_string()));
-        assert_eq!(topics("topics=finalized_checkpoint"), unknown("finalized_checkpoint"));
-        assert_eq!(topics("topics=block,finalized_checkpoint"), unknown("finalized_checkpoint"));
+        assert_eq!(topics("topics=voluntary_exit"), unknown("voluntary_exit"));
+        assert_eq!(topics("topics=block,voluntary_exit"), unknown("voluntary_exit"));
         assert_eq!(topics("topics=head_v2&topics=chain_reorg"), unknown("chain_reorg"));
     }
 

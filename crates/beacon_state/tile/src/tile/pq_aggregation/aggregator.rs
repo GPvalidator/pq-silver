@@ -20,6 +20,10 @@ use super::{
 };
 use crate::{counters::BeaconStateCounters, tile::Producers};
 
+/// A merge waits this fraction of the next slot for that slot's block to be
+/// verified: 3 s of 12 s, the attestation deadline.
+const MERGE_WAIT_DIVISOR: u64 = 4;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AggregationKey {
     Leaf(LeafKey),
@@ -98,6 +102,11 @@ pub struct PqAggregator {
     changed: bool,
     /// By attestation slot.
     merges: FxHashMap<Slot, MergeAggregation>,
+    /// When the next merge opens unless a block opens it first. No event
+    /// marks that moment, so `send_next` watches the clock until then.
+    merge_opens: Option<Nanos>,
+    /// The newest slot whose block is done with the leanVM sidecar.
+    block_settled: Slot,
     /// `None`: a block gets only the merge of the newest slot it may
     /// include.
     rolling: Option<Rolling>,
@@ -114,6 +123,8 @@ impl Default for PqAggregator {
         Self {
             leaves: FxHashMap::default(),
             merges: FxHashMap::default(),
+            merge_opens: None,
+            block_settled: 0,
             rolling: None,
             changed: false,
             leanvm: LeanVm::default(),
@@ -174,6 +185,10 @@ impl PqAggregator {
     /// until the first block to include it is due or the rolling proof has
     /// taken the merge in. A merge refuses it once it holds too many
     /// committees.
+    ///
+    /// The merge is proved in the next slot, once that slot's block is done
+    /// with the leanVM sidecar, so that the merge does not delay the block.
+    /// It stops waiting for a late block at the attestation deadline.
     pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
         BeaconStateCounters::PqMergeClaimsOffered.add(aggregate.claims.len() as u64);
         let slot = aggregate.group.slot;
@@ -183,8 +198,14 @@ impl PqAggregator {
             silver_log::debug!(slot, "aggregate after its slot's merge ended");
             return;
         }
-        let merge = (self.merges.entry(slot))
-            .or_insert_with(|| MergeAggregation::new(ticker.slot_start(slot + 1), deadline));
+        let opens = if self.block_settled > slot {
+            ticker.since_genesis()
+        } else {
+            ticker.slot_start(slot + 1) + Nanos(ticker.slot_start(1).0 / MERGE_WAIT_DIVISOR)
+        };
+        self.merge_opens = Some(self.merge_opens.map_or(opens, |held| held.min(opens)));
+        let merge =
+            (self.merges.entry(slot)).or_insert_with(|| MergeAggregation::new(opens, deadline));
         if !merge.add(aggregate) {
             silver_log::warn!(slot, "aggregate dropped: the merge holds too many committees");
             return;
@@ -228,15 +249,25 @@ impl PqAggregator {
     /// Drops the aggregations of slots before `floor`. The request in flight
     /// for one still occupies the leanVM sidecar until its response arrives.
     ///
-    /// Called as slot `floor + 1` starts, which opens the merge of slot
-    /// `floor`. The block of slot `floor + 1` may include the `POOL_SLOTS`
-    /// slots up to `floor - 1`.
+    /// Called as slot `floor + 1` starts. The block of that slot may include
+    /// the `POOL_SLOTS` slots up to `floor - 1`.
     pub fn prune_before(&mut self, floor: Slot) {
         self.leaves.retain(|leaf, _| leaf.slot >= floor);
         self.merges.retain(|&slot, _| slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ >= floor);
         if let Some(rolling) = &mut self.rolling {
             rolling.expire_before(floor.saturating_sub(POOL_SLOTS));
         }
+        self.changed = true;
+    }
+
+    /// The block of `slot` was imported, rejected or dropped: its proofs no
+    /// longer wait on the leanVM sidecar. The merges of earlier slots open.
+    pub fn on_block_settled(&mut self, slot: Slot, ticker: &SlotTicker) {
+        self.block_settled = self.block_settled.max(slot);
+        let now = ticker.since_genesis();
+        (self.merges.iter_mut())
+            .filter(|(merged, _)| **merged < slot)
+            .for_each(|(_, merge)| merge.open_by(now));
         self.changed = true;
     }
 
@@ -260,10 +291,14 @@ impl PqAggregator {
         tcache: &mut TProducer,
         producers: &mut Producers,
     ) {
+        let now = ticker.since_genesis();
+        if self.merge_opens.is_some_and(|opens| now >= opens) {
+            self.merge_opens = None;
+            self.changed = true;
+        }
         if !self.changed || !self.leanvm.is_idle() {
             return;
         }
-        let now = ticker.since_genesis();
         let rolling_request = self.next_rolling_request(ticker, tcache);
         if let Some(rolling) = &self.rolling {
             BeaconStateCounters::PqMergedClaims.set(rolling.claims_len() as u64);
@@ -312,7 +347,7 @@ impl PqAggregator {
             let (&slot, merge) = (self.merges.iter())
                 .filter(|(slot, merge)| rolling.awaits(**slot) && merge.is_proved())
                 .min_by_key(|(slot, _)| **slot)?;
-            if now < ticker.slot_start(slot + 1) || merge.priority(now).is_some() {
+            if merge.priority(now).is_some() {
                 return None;
             }
             let taken = merge.proved()?;

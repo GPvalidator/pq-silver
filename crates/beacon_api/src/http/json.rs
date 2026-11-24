@@ -20,7 +20,8 @@ use silver_common::{
         Eth1DataView, ExecutionPayloadBidView, ExecutionPayloadEnvelopeView, ExecutionPayloadView,
         IndexedAttestationPqView, PAYLOAD_ATTESTATION_DATA_SIZE, PROPOSER_SLASHING_PQ_SIZE,
         PayloadAttestationDataView, ProposerPreferencesView, ProvedAttestationView,
-        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedExecutionPayloadBidPqView,
+        SIGNED_PROPOSER_PREFERENCES_PQ_SIZE, SINGLE_ATT_PQ_SIZE, SignedBeaconBlockPqView,
+        SignedExecutionPayloadBidPqView, SignedExecutionPayloadEnvelopePqView,
         SignedProposerPreferencesPqView, SingleAttestationPqView,
         ValidatorPreregistrationRequestView, VoluntaryExitRequestView, WITHDRAWAL_SIZE,
         WithdrawalRequestView, WithdrawalView, XMSSSignature, variable_list_items,
@@ -468,6 +469,25 @@ impl Json<'_> {
         self.end_object();
     }
 
+    pub(crate) fn finalized_checkpoint_event(
+        &mut self,
+        block_root: &[u8; 32],
+        state_root: &[u8; 32],
+        epoch: u64,
+        execution_optimistic: bool,
+    ) {
+        self.begin_object();
+        self.key("block");
+        self.hex(block_root);
+        self.key("state");
+        self.hex(state_root);
+        self.key("epoch");
+        self.quoted_u64(epoch);
+        self.key("execution_optimistic");
+        self.bool(execution_optimistic);
+        self.end_object();
+    }
+
     pub(crate) fn head_event(&mut self, head: &HeadEvent) {
         let roots = ["previous_duty_dependent_root", "current_duty_dependent_root"];
         self.head(head, roots, None);
@@ -693,11 +713,67 @@ impl Json<'_> {
         self.key("block");
         self.beacon_block_pq(block);
         self.key("execution_payload_envelope");
+        self.execution_payload_envelope_pq(envelope, payload);
+        self.key("kzg_proofs");
+        self.hex_items::<BYTES_PER_KZG_PROOF>(payload.cell_proofs);
+        self.key("blobs");
+        self.hex_items::<BYTES_PER_BLOB>(payload.blobs);
+        self.end_object();
+    }
+
+    /// The envelope is `envelope`'s fixed part followed by `payload`'s
+    /// execution payload and requests.
+    pub(crate) fn execution_payload_envelope_pq(
+        &mut self,
+        envelope: &[u8; EXECUTION_PAYLOAD_ENVELOPE_MIN],
+        payload: &PayloadFrame<'_>,
+    ) {
+        self.envelope_pq(envelope, payload.execution_payload, payload.execution_requests);
+    }
+
+    /// `GetExecutionPayloadEnvelopeResponse`
+    /// (`apis/beacon/execution_payload/envelope_get.yaml`) for a PQ
+    /// `SignedExecutionPayloadEnvelope`.
+    pub(crate) fn signed_execution_payload_envelope_pq(
+        &mut self,
+        version: &str,
+        flags: ReadFlags,
+        signed: &[u8],
+    ) {
+        let message = SignedExecutionPayloadEnvelopePqView::message(signed);
+        let fixed = message[..EXECUTION_PAYLOAD_ENVELOPE_MIN].try_into().expect("a sized envelope");
+        self.begin_object();
+        self.key("version");
+        self.string(version);
+        self.key("execution_optimistic");
+        self.bool(flags.execution_optimistic);
+        self.key("finalized");
+        self.bool(flags.finalized);
+        self.key("data");
+        self.begin_object();
+        self.key("message");
+        self.envelope_pq(
+            fixed,
+            ExecutionPayloadEnvelopeView::payload(message),
+            ExecutionPayloadEnvelopeView::execution_requests(message),
+        );
+        self.key("signature");
+        self.hex(SignedExecutionPayloadEnvelopePqView::signature(signed));
+        self.end_object();
+        self.end_object();
+    }
+
+    fn envelope_pq(
+        &mut self,
+        envelope: &[u8; EXECUTION_PAYLOAD_ENVELOPE_MIN],
+        payload: &[u8],
+        requests: &[u8],
+    ) {
         self.begin_object();
         self.key("payload");
-        self.execution_payload_gloas(payload.execution_payload);
+        self.execution_payload_gloas(payload);
         self.key("execution_requests");
-        self.execution_requests_pq(payload.execution_requests);
+        self.execution_requests_pq(requests);
         self.key("builder_index");
         self.quoted_u64(ExecutionPayloadEnvelopeView::builder_index(envelope));
         self.key("beacon_block_root");
@@ -705,10 +781,30 @@ impl Json<'_> {
         self.key("parent_beacon_block_root");
         self.hex(ExecutionPayloadEnvelopeView::parent_beacon_block_root(envelope));
         self.end_object();
-        self.key("kzg_proofs");
-        self.hex_items::<BYTES_PER_KZG_PROOF>(payload.cell_proofs);
-        self.key("blobs");
-        self.hex_items::<BYTES_PER_BLOB>(payload.blobs);
+    }
+
+    /// `GetBlockV2Response` (`apis/beacon/blocks/block.v2.yaml`) for a PQ
+    /// `SignedBeaconBlock`.
+    pub(crate) fn signed_beacon_block_pq(
+        &mut self,
+        version: &str,
+        flags: ReadFlags,
+        signed: &[u8],
+    ) {
+        self.begin_object();
+        self.key("version");
+        self.string(version);
+        self.key("execution_optimistic");
+        self.bool(flags.execution_optimistic);
+        self.key("finalized");
+        self.bool(flags.finalized);
+        self.key("data");
+        self.begin_object();
+        self.key("message");
+        self.beacon_block_pq(SignedBeaconBlockPqView::message(signed));
+        self.key("signature");
+        self.hex(SignedBeaconBlockPqView::signature(signed));
+        self.end_object();
         self.end_object();
     }
 
@@ -1469,6 +1565,30 @@ mod tests {
     /// Lighthouse decodes the block body with `deny_unknown_fields`, so every
     /// container carries exactly its schema's fields. Values were checked
     /// against Lighthouse's own decoder on random blocks.
+    #[test]
+    fn signed_block_carries_its_message_signature_and_read_flags() {
+        use silver_common::{
+            ssz_view::XMSS_SIGNATURE_SIZE,
+            test_util::{SynthBid, SynthBlock},
+        };
+
+        let signed = SynthBlock::pq(9, SynthBid::new(&[0x33; BYTES_PER_KZG_COMMITMENT]));
+        let flags = ReadFlags { execution_optimistic: false, finalized: true };
+        let body = write(|json| json.signed_beacon_block_pq("pq", flags, signed.bytes()));
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(parsed["version"], "pq");
+        assert_eq!(
+            (&parsed["execution_optimistic"], &parsed["finalized"]),
+            (&false.into(), &true.into())
+        );
+        let data = &parsed["data"];
+        assert_eq!(data["message"]["slot"], "9");
+        assert!(data["message"]["body"]["attestations"].is_array());
+        let signature = data["signature"].as_str().unwrap();
+        assert_eq!(signature.len(), 2 + 2 * XMSS_SIGNATURE_SIZE);
+    }
+
     #[test]
     fn pq_block_and_envelope_carry_exactly_the_schema_fields() {
         use silver_common::{

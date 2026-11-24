@@ -9,8 +9,8 @@ use super::{
 };
 
 /// The aggregates of one attestation slot, proved as one proof. Proving
-/// starts with the next slot, once the slot's aggregates are in, and ends when
-/// the first block to include them is due.
+/// starts at `opens`, once the slot's aggregates are in, and ends when the
+/// first block to include them is due.
 pub(super) struct MergeAggregation {
     opens: Nanos,
     /// The votes of each aggregate.
@@ -23,6 +23,10 @@ impl MergeAggregation {
     pub(super) fn new(opens: Nanos, deadline: Nanos) -> Self {
         let (groups, strategy) = (Vec::new(), MarginalGain::default());
         Self { opens, groups, strategy, core: Aggregation::new(deadline) }
+    }
+
+    pub(super) fn open_by(&mut self, at: Nanos) {
+        self.opens = self.opens.min(at);
     }
 
     /// `false` once the merge holds too many committees for another.

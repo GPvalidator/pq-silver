@@ -17,21 +17,21 @@ pub(crate) fn execution_payload_envelope(
     _ctx: &ApiCtx,
     resp: &mut Response<'_>,
 ) {
-    if !req.accepts_ssz() {
-        return resp.error(406, "only application/octet-stream is served");
-    }
     let slot = req.params.get("slot").and_then(parse_uint64);
     let root = req.params.get("beacon_block_root").and_then(parse_root);
     let (Some(slot), Some(beacon_block_root)) = (slot, root) else {
         return resp.error(400, "invalid slot or beacon block root");
     };
-    resp.defer(Outcome::AwaitingEnvelope(EnvelopeRequest { slot, beacon_block_root }));
+    let ssz = req.accepts_ssz();
+    resp.defer(Outcome::AwaitingEnvelope(EnvelopeRequest { slot, beacon_block_root, ssz }));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EnvelopeRequest {
     pub(crate) slot: Slot,
     pub(crate) beacon_block_root: B256,
+    /// Else JSON.
+    pub(crate) ssz: bool,
 }
 
 impl EnvelopeRequest {
@@ -60,7 +60,13 @@ impl EnvelopeRequest {
         let Some(frame) = PayloadFrame::parse(frame) else {
             return resp.error(500, "cached execution payload could not be read");
         };
-        let headers = [("Eth-Consensus-Version", spec.fork_at_slot(self.slot).name())];
+        let version = spec.fork_at_slot(self.slot).name();
+        if !self.ssz {
+            return resp.versioned_json(version, |json| {
+                json.execution_payload_envelope_pq(&envelope.header, &frame)
+            });
+        }
+        let headers = [("Eth-Consensus-Version", version)];
         resp.send(200, Some(SSZ_MEDIA_TYPE), &headers, &[
             &envelope.header,
             frame.execution_payload,

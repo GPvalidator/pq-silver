@@ -109,6 +109,12 @@ pub enum BeaconApiRequest {
         lookup: BlockLookup,
         with_bytes: bool,
     },
+    /// The stored `SignedExecutionPayloadEnvelope` of a block. Answered as a
+    /// `BeaconApiResponse::Block` whose bytes are the envelope's.
+    BlockEnvelope {
+        request_id: u64,
+        lookup: BlockLookup,
+    },
     BeaconCommitteeSubscriptions {
         subscriptions: TCacheRead,
     },
@@ -1395,6 +1401,12 @@ pub enum BeaconStateEvent {
         /// A block's root, when it was relayed or already known.
         block_root: Option<[u8; 32]>,
     },
+    /// A local validator's vote for `block_root` at `slot` passed gossip
+    /// validation.
+    LocalAttestation {
+        slot: u64,
+        block_root: [u8; 32],
+    },
     Status {
         ssz: [u8; STATUS_V2_SIZE],
         latest_block_slot: u64,
@@ -1813,6 +1825,7 @@ impl BeaconStateEvent {
             Self::ReplayComplete |
             Self::ProposedPayload(_) |
             Self::LocalGossipVerdict { .. } |
+            Self::LocalAttestation { .. } |
             Self::BlockReceived { .. } |
             Self::AttestersShuffling { .. } |
             Self::Reorg { .. } |

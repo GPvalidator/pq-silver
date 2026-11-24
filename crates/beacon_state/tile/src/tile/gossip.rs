@@ -733,7 +733,17 @@ impl BeaconStateTile {
                 continue;
             }
             let feedback = match p {
-                PreparedPqVote::Attestation(p) => self.commit_pq_attestation(p),
+                PreparedPqVote::Attestation(p) => {
+                    let target = p.checked.target;
+                    let feedback = self.commit_pq_attestation(p);
+                    if m.stream_id == LOCAL_GOSSIP_STREAM_ID && feedback == Feedback::Accept {
+                        producers.produce(BeaconStateEvent::LocalAttestation {
+                            slot: target.attestation_slot,
+                            block_root: target.block_root,
+                        });
+                    }
+                    feedback
+                }
                 PreparedPqVote::Ptc(p) => {
                     committed_ptc |= self.record_pq_ptc_vote(&p.vote);
                     Feedback::Accept

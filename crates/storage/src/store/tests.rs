@@ -305,7 +305,7 @@ fn fork_tree_persist_serve_promote() {
 // store on finalization, prune the orphan, and rebuild the index on reload.
 #[test]
 fn envelope_persist_promote_prune() {
-    use silver_common::{TCache, TCacheProducer};
+    use silver_common::{BeaconApiResponse, BlockLookup, TCache, TCacheProducer};
 
     let dir = TempDir::new().unwrap();
     let store_path = dir.path().to_str().unwrap().to_owned();
@@ -358,6 +358,32 @@ fn envelope_persist_promote_prune() {
         .join(super::io::unfinalized_envelope_name(slot, &root_b));
     assert!(unf_a.exists());
     assert!(unf_b.exists());
+
+    // The API reads a block's envelope by the block's root or slot.
+    store.queue_envelope_request(21, BlockLookup::Root(root_b));
+    store.queue_envelope_request(22, BlockLookup::Root([0xEE; 32]));
+    store.queue_envelope_request(23, BlockLookup::Slot(slot));
+    let mut api = vec![];
+    store
+        .file_io(|_| fork_digest, &mut producer, &mut |event| match event {
+            IoEvent::ApiResponse(response) => api.push(response),
+            other => panic!("api requests answer the api alone, got {other:?}"),
+        })
+        .unwrap();
+    let [
+        BeaconApiResponse::Block { request_id: 21, block: Some(fork) },
+        BeaconApiResponse::Block { request_id: 22, block: None },
+        BeaconApiResponse::Block { request_id: 23, block: Some(head) },
+    ] = api[..]
+    else {
+        panic!("expected two envelopes and a miss, got {api:?}");
+    };
+    let mut served =
+        TCacheReader::single(producer.cache_ref(), "env_api_read", TReadMode::Sliding).unwrap();
+    assert_eq!((fork.root, fork.canonical, fork.finalized), (root_b, false, false));
+    assert_eq!(served.acquire(fork.ssz.unwrap()).buffer().unwrap().0, &env_b);
+    assert_eq!((head.root, head.canonical), (root_a, true));
+    assert_eq!(served.acquire(head.ssz.unwrap()).buffer().unwrap().0, &env_a);
 
     // Replay pairs each block with its envelope: a gloas child's precheck
     // only passes once the parent's payload is verified.
