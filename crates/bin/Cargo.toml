@@ -21,6 +21,7 @@ silver_peer.workspace = true
 silver_preset.workspace = true
 silver_storage.workspace = true
 silver_httpcore.workspace = true
+silver_leanvm.workspace = true
 
 build-info.workspace = true
 clap.workspace = true
