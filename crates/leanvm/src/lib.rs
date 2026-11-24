@@ -35,7 +35,7 @@ use silver_common::{
     IngestionTime, LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId,
     TCacheProducer, TCacheReader, TCacheTable, TProducer, TReadMode,
 };
-use wire::{Call, Rejection, Request};
+use wire::{Call, Refusal, Rejection, Request};
 
 /// Aggregates taken off the spine and waiting for the prover. `beacon_state`
 /// keeps one in flight, so a full queue means it lost track; past it each
@@ -260,15 +260,18 @@ fn respond(body: &[u8]) -> Vec<u8> {
             let valid = AggregateProof::from_bytes(&proof).is_some_and(|p| p.verify(&claims));
             wire::encode_verdict(valid).to_vec()
         }
-        Ok(Call::Aggregate(request)) => wire::encode_response(&aggregate(request)),
-        Err(rejection) => {
-            silver_log::warn!(rejection = ?rejection.0, message = rejection.1, "leanvm request refused");
-            wire::encode_response(&Err(rejection))
+        Ok(Call::Aggregate(request)) => match aggregate(request) {
+            Ok((claims, proof)) => wire::encode_proven(&claims, &proof),
+            Err(refusal) => refusal.encode(),
+        },
+        Err(refusal) => {
+            silver_log::warn!(rejection = ?refusal.why, message = refusal.message, "leanvm request refused");
+            refusal.encode()
         }
     }
 }
 
-fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), (Rejection, String)> {
+fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), Refusal> {
     let started = Instant::now();
     let shape = (request.children.len(), request.raw_lean_xmss.len(), request.log_inv_rate);
     let children = request
@@ -277,14 +280,17 @@ fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), (R
         .enumerate()
         .map(|(i, (claims, proof))| match AggregateProof::from_bytes(&proof) {
             Some(proof) => Ok((claims, proof)),
-            None => Err((Rejection::InvalidChild, format!("child {i}'s proof does not decode"))),
+            None => {
+                let message = format!("child {i}'s proof does not decode");
+                Err(Refusal { why: Rejection::InvalidChild, message })
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     let blobs = match request.blobs.len() {
         0 => None,
         _ => Some(
             lean_vm::lean_da::BlobMatrix::build(&request.blobs)
-                .map_err(|e| (Rejection::InvalidInput, e.to_string()))?,
+                .map_err(|e| Refusal { why: Rejection::InvalidInput, message: e.to_string() })?,
         ),
     };
     let output = request.output.as_ref().map_or(OutputClaims::All, OutputClaims::Only);
@@ -305,7 +311,7 @@ fn aggregate(request: Request) -> Result<(lean_vm::AggregateClaims, Vec<u8>), (R
         }
         Err(error) => {
             silver_log::warn!(children, signatures, rate, ?elapsed, %error, "leanvm refused");
-            Err((error.into(), error.to_string()))
+            Err(Refusal { why: error.into(), message: error.to_string() })
         }
     }
 }

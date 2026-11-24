@@ -87,17 +87,17 @@ fn truncations_and_trailing_bytes_are_refused() {
 fn counts_past_the_body_or_the_bounds_are_refused() {
     let mut huge = vec![OP_AGGREGATE, 1];
     huge.extend(u64::MAX.to_le_bytes());
-    assert!(matches!(decode_request(&huge), Err((Rejection::Malformed, _))));
+    assert!(matches!(decode_request(&huge), Err(Refusal { why: Rejection::Malformed, .. })));
 
     let mut many = request();
     many.children = vec![(AggregateClaims::default(), Vec::new()); MAX_RECURSIONS + 1];
     let refused = decode_request(&encode_request(&many));
-    assert!(matches!(refused, Err((Rejection::InvalidInput, _))));
+    assert!(matches!(refused, Err(Refusal { why: Rejection::InvalidInput, .. })));
 
     let mut many = request();
     many.blobs = vec![[0; lean_da::BLOB_SYMBOLS]; lean_da::DA_MAX_ROWS + 1];
     let refused = decode_request(&encode_request(&many));
-    assert!(matches!(refused, Err((Rejection::InvalidInput, _))));
+    assert!(matches!(refused, Err(Refusal { why: Rejection::InvalidInput, .. })));
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn a_verify_request_decodes() {
     assert!(is_verify(&bytes));
     let Ok(Call::Verify(decoded, proof)) = decode_request(&bytes) else { panic!("not a verify") };
     assert_eq!((decoded, proof), (claims, vec![9, 9]));
-    assert!(matches!(decode_request(&[7]), Err((Rejection::Malformed, _))));
+    assert!(matches!(decode_request(&[7]), Err(Refusal { why: Rejection::Malformed, .. })));
 }
 
 #[test]
@@ -118,9 +118,9 @@ fn responses_carry_status_then_fields() {
     let mut expected = vec![OK];
     put_bytes(&mut expected, &claims.to_bytes());
     put_bytes(&mut expected, &[1, 2, 3]);
-    assert_eq!(encode_response(&Ok((claims, vec![1, 2, 3]))), expected);
+    assert_eq!(encode_proven(&claims, &[1, 2, 3]), expected);
 
-    let refused = encode_response(&Err((Rejection::InvalidInput, "no".into())));
+    let refused = Refusal { why: Rejection::InvalidInput, message: "no".into() }.encode();
     assert_eq!(refused, [&[1u8][..], &2u64.to_le_bytes(), b"no"].concat());
     assert_eq!(encode_verdict(true), [OK, 1]);
 }

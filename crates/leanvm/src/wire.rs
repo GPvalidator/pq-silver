@@ -43,6 +43,26 @@ impl From<AggregateError> for Rejection {
     }
 }
 
+/// A response without a proof.
+#[derive(Debug)]
+pub struct Refusal {
+    pub why: Rejection,
+    pub message: String,
+}
+
+impl Refusal {
+    fn malformed(what: &str) -> Self {
+        Self { why: Rejection::Malformed, message: format!("malformed request: {what}") }
+    }
+
+    /// The status, then the message.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![self.why as u8];
+        put_bytes(&mut out, self.message.as_bytes());
+        out
+    }
+}
+
 /// A request, decoded.
 pub enum Call {
     Aggregate(Request),
@@ -68,36 +88,37 @@ pub fn is_verify(body: &[u8]) -> bool {
     body.first() == Some(&OP_VERIFY)
 }
 
-pub fn decode_request(body: &[u8]) -> Result<Call, (Rejection, String)> {
-    let malformed = |what: &str| (Rejection::Malformed, format!("malformed request: {what}"));
+pub fn decode_request(body: &[u8]) -> Result<Call, Refusal> {
     let mut c = Cursor(body);
     let call = match c.u8() {
-        Some(OP_AGGREGATE) => Call::Aggregate(decode_aggregate(&mut c, malformed)?),
+        Some(OP_AGGREGATE) => Call::Aggregate(decode_aggregate(&mut c)?),
         Some(OP_VERIFY) => {
-            let claims = c.claims().ok_or_else(|| malformed("claims"))?;
-            let proof = c.bytes().ok_or_else(|| malformed("proof"))?;
+            let claims = c.claims().ok_or_else(|| Refusal::malformed("claims"))?;
+            let proof = c.bytes().ok_or_else(|| Refusal::malformed("proof"))?;
             Call::Verify(claims, proof.to_vec())
         }
-        Some(op) => return Err((Rejection::Malformed, format!("unknown operation {op}"))),
-        None => return Err(malformed("empty")),
+        Some(op) => {
+            let message = format!("unknown operation {op}");
+            return Err(Refusal { why: Rejection::Malformed, message });
+        }
+        None => return Err(Refusal::malformed("empty")),
     };
     if !c.is_empty() {
-        return Err(malformed("trailing bytes"));
+        return Err(Refusal::malformed("trailing bytes"));
     }
     Ok(call)
 }
 
-fn decode_aggregate(
-    c: &mut Cursor,
-    malformed: impl Fn(&str) -> (Rejection, String),
-) -> Result<Request, (Rejection, String)> {
+fn decode_aggregate(c: &mut Cursor) -> Result<Request, Refusal> {
+    let malformed = Refusal::malformed;
     let log_inv_rate = c.u8().ok_or_else(|| malformed("no rate"))?.into();
 
     // Each child is at least its two lengths.
     let n = c.count(16).ok_or_else(|| malformed("children"))?;
     // Checked before decoding: a decoded child takes more memory than its bytes.
     if n > MAX_RECURSIONS {
-        return Err((Rejection::InvalidInput, "more than MAX_RECURSIONS children".into()));
+        let message = "more than MAX_RECURSIONS children".into();
+        return Err(Refusal { why: Rejection::InvalidInput, message });
     }
     let mut children = Vec::with_capacity(n);
     for i in 0..n {
@@ -127,7 +148,7 @@ fn decode_aggregate(
     let n = c.count(BLOB_BYTES).ok_or_else(|| malformed("blobs"))?;
     if n > lean_da::DA_MAX_ROWS {
         let message = format!("{n} blobs: expected 1 to {}", lean_da::DA_MAX_ROWS);
-        return Err((Rejection::InvalidInput, message));
+        return Err(Refusal { why: Rejection::InvalidInput, message });
     }
     let blobs = (0..n)
         .map(|_| {
@@ -144,23 +165,11 @@ fn decode_aggregate(
     Ok(Request { children, raw_lean_xmss, raw_lean_sphincs, blobs, output, log_inv_rate })
 }
 
-/// An `aggregate` response: status 0, the claims and the proof; or a
-/// rejection's status and message.
-pub fn encode_response(
-    outcome: &Result<(AggregateClaims, Vec<u8>), (Rejection, String)>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    match outcome {
-        Ok((claims, proof)) => {
-            out.push(OK);
-            put_bytes(&mut out, &claims.to_bytes());
-            put_bytes(&mut out, proof);
-        }
-        Err((rejection, message)) => {
-            out.push(*rejection as u8);
-            put_bytes(&mut out, message.as_bytes());
-        }
-    }
+/// An `aggregate` response: status 0, the claims and the proof.
+pub fn encode_proven(claims: &AggregateClaims, proof: &[u8]) -> Vec<u8> {
+    let mut out = vec![OK];
+    put_bytes(&mut out, &claims.to_bytes());
+    put_bytes(&mut out, proof);
     out
 }
 
