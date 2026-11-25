@@ -38,6 +38,7 @@ ipnet-trie = "0.3.0"
 pprof.workspace = true
 rand.workspace = true
 rand_core.workspace = true
+silver_common = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
 [lints]
