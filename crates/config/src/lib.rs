@@ -137,10 +137,59 @@ impl Default for MetricsConfig {
     }
 }
 
+/// The core each tile's thread is pinned to, and the logger's. Cores may
+/// repeat: an idle tile parks, so tiles can share a core. The leanVM prover
+/// takes physical cores after the highest of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TileCores {
+    pub control: usize,
+    pub network: usize,
+    pub beacon_state: usize,
+    pub storage: usize,
+    pub application_boundary: usize,
+    pub data_columns: usize,
+    pub log: usize,
+}
+
+impl Default for TileCores {
+    fn default() -> Self {
+        Self {
+            control: 1,
+            network: 2,
+            beacon_state: 3,
+            storage: 4,
+            application_boundary: 5,
+            data_columns: 6,
+            log: silver_log::DEFAULT_LOG_CORE,
+        }
+    }
+}
+
+impl TileCores {
+    pub fn highest(&self) -> usize {
+        let Self {
+            control,
+            network,
+            beacon_state,
+            storage,
+            application_boundary,
+            data_columns,
+            log,
+        } = *self;
+        [control, network, beacon_state, storage, application_boundary, data_columns, log]
+            .into_iter()
+            .max()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub tile_cores: TileCores,
     #[serde(default)]
     network: Network,
     #[serde(default)]
@@ -235,7 +284,7 @@ pub struct Config {
     #[serde(default)]
     pbs: Option<PbsConfig>,
     /// How many cores the leanVM prover uses: the first physical cores after
-    /// the tiles' and the logger's. Unset: all of them. 0: no prover.
+    /// `tile_cores`. Unset: all of them. 0: no prover.
     #[serde(default)]
     leanvm_cores: Option<usize>,
     /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
@@ -628,6 +677,20 @@ mod tests {
         assert!(Config::from_toml("", Overrides::default()).unwrap().pq_rolling_aggregate());
         let off = Config::from_toml("pq_rolling_aggregate = false", Overrides::default());
         assert!(!off.unwrap().pq_rolling_aggregate());
+    }
+
+    #[test]
+    fn tile_cores_default_to_one_core_each_and_may_share_one() {
+        let cfg = Config::from_toml("", Overrides::default()).unwrap();
+        assert_eq!(cfg.tile_cores, TileCores::default());
+        assert_eq!(cfg.tile_cores.highest(), silver_log::DEFAULT_LOG_CORE);
+        let toml = "[tile_cores]\ncontrol = 0\nnetwork = 0\nbeacon_state = 0\nstorage = 0\n\
+                    application_boundary = 0\ndata_columns = 0\nlog = 0";
+        let one = Config::from_toml(toml, Overrides::default()).unwrap();
+        assert_eq!(one.tile_cores.highest(), 0);
+        let partial = Config::from_toml("[tile_cores]\nlog = 9", Overrides::default()).unwrap();
+        assert_eq!(partial.tile_cores, TileCores { log: 9, ..TileCores::default() });
+        assert!(Config::from_toml("[tile_cores]\nleanvm = 1", Overrides::default()).is_err());
     }
 
     #[test]

@@ -67,9 +67,6 @@ const CONTROL_RPC_TCACHE_SIZE: usize = 1 << 20;
 /// two-million-validator set, so the two the validator API serves never wait
 /// on the one being written.
 const BEACON_STATE_TCACHE_SIZE: usize = 1 << 25;
-/// Tiles run on cores 1 to 6 and the logger on `LOG_CORE`; the leanVM
-/// prover takes the physical cores after them.
-const LEANVM_FIRST_CORE: usize = silver_log::LOG_CORE + 1;
 /// leanVM responses: a proof is at most 1 MiB, and `beacon_state` copies
 /// each out as it arrives.
 const LEANVM_TCACHE_SIZE: usize = 1 << 24;
@@ -103,13 +100,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Before tracing, which pins the logger to a configured core.
+    let config = args.config()?;
+    let cores = config.tile_cores;
+    silver_log::set_log_core(cores.log);
+
     let build_info_log = format!("silver build info: {BUILD_INFO}");
     let _tracing = initialise_tracing_log_on_core(
         "silver",
         10,
         None,
         false,
-        Some(silver_log::LOG_CORE),
+        Some(cores.log),
         Some(&build_info_log),
     );
     if let Err(e) = silver_log::counts::enable(APP_NAME) {
@@ -120,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // `#[timed]` is inert until a process opts in.
     enable_profiler(APP_NAME);
 
-    let config = args.config()?;
+    silver_log::info!("loaded config: {config:#?}");
     #[cfg(not(feature = "metrics"))]
     if config.metrics.enabled {
         return Err("metrics.enabled requires building silver with --features metrics".into());
@@ -429,7 +431,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         tile
     };
 
-    let mut leanvm_cores = silver_leanvm::physical_cores(LEANVM_FIRST_CORE);
+    let mut leanvm_cores = silver_leanvm::physical_cores(cores.highest() + 1);
     if let Some(count) = config.leanvm_cores() {
         if count > leanvm_cores.len() {
             let free = leanvm_cores.len();
@@ -453,12 +455,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let spine = SilverSpine::new(None);
     spine.start(None, None, |scoped_spine| {
         let tiles = [
-            attached(control_tile, scoped_spine, 1),
-            attached(network_tile, scoped_spine, 2),
-            attached(beacon_state_tile, scoped_spine, 3),
-            attached(storage_tile, scoped_spine, 4),
-            attached(application_boundary_tile, scoped_spine, 5),
-            attached(data_columns_tile, scoped_spine, 6),
+            attached(control_tile, scoped_spine, cores.control),
+            attached(network_tile, scoped_spine, cores.network),
+            attached(beacon_state_tile, scoped_spine, cores.beacon_state),
+            attached(storage_tile, scoped_spine, cores.storage),
+            attached(application_boundary_tile, scoped_spine, cores.application_boundary),
+            attached(data_columns_tile, scoped_spine, cores.data_columns),
             (
                 leanvm_tile.name(),
                 Box::new(tile_runner(leanvm_tile, scoped_spine, leanvm_tile_config)),

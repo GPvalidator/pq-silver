@@ -30,7 +30,7 @@ pub struct Args {
     #[arg(long)]
     pbs_endpoint: Option<String>,
     /// How many cores the leanVM prover uses: the first physical cores after
-    /// the tiles' and the logger's. Default: all of them. 0: no prover.
+    /// the config's `tile_cores`. Default: all of them. 0: no prover.
     #[arg(long)]
     leanvm_cores: Option<usize>,
     #[command(subcommand)]
@@ -47,10 +47,6 @@ impl Args {
             pbs_endpoint: self.pbs_endpoint,
             leanvm_cores: self.leanvm_cores,
         };
-        let config = Config::load(self.config.as_deref(), overrides)?;
-
-        silver_log::info!("loaded config: {config:#?}");
-
-        Ok(config)
+        Config::load(self.config.as_deref(), overrides)
     }
 }
