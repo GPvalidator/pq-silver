@@ -140,14 +140,6 @@ pub(super) struct StfDone {
     gate: StfGate,
 }
 
-/// The root and stage of a block held back from import.
-fn held_stage(feedback: Feedback) -> Option<(B256, BlockStage)> {
-    match feedback {
-        Feedback::AwaitData(root) => Some((root, BlockStage::AwaitData)),
-        _ => None,
-    }
-}
-
 impl BeaconStateTile {
     pub fn try_apply_block(&mut self, data: &[u8], emit: impl FnMut(BeaconStateEvent)) -> Feedback {
         match self.parse_and_verify_block(data, false) {
@@ -198,7 +190,7 @@ impl BeaconStateTile {
                 parsed
             }
             Err(PrecheckError::AwaitingData { block_root }) => {
-                return self.still_held(data, Feedback::AwaitData(block_root), source, producers);
+                return self.still_held(data, block_root, source, producers);
             }
             Err(e) => {
                 let f = e.feedback();
@@ -280,18 +272,19 @@ impl BeaconStateTile {
         true
     }
 
-    /// A re-fetch of a block already held: sync learns its transition ran.
+    /// A re-fetch of a staged block: sync learns its transition ran.
     fn still_held(
         &self,
         data: &[u8],
-        feedback: Feedback,
+        block_root: B256,
         source: BlockSource,
         producers: &mut Producers,
     ) -> Feedback {
-        if let (BlockSource::Rpc, Some((root, stage))) = (source, held_stage(feedback)) {
-            self.emit_block_received(data, root, stage, source, None, producers);
+        if source == BlockSource::Rpc {
+            let stage = BlockStage::AwaitData;
+            self.emit_block_received(data, block_root, stage, source, None, producers);
         }
-        feedback
+        Feedback::AwaitData(block_root)
     }
 
     /// Everything the rest of the node learns from an import after its
