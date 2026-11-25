@@ -264,7 +264,7 @@ impl BeaconStateTile {
         };
         let f = self.apply_and_import(parsed, data, gate, producers);
         let mut announce = |stage, gate| {
-            let stf = Some(StfStamp { validated_at, gate });
+            let stf = Some(StfStamp { validated_at, applied_at: Nanos::now(), gate });
             self.emit_block_received(data, block_root, stage, source, stf, producers)
         };
         match f {

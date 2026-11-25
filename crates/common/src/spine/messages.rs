@@ -1514,6 +1514,8 @@ pub enum BlockStage {
 pub struct StfStamp {
     /// Wall clock when CL validation passed and the transition began.
     pub validated_at: Nanos,
+    /// Wall clock when the state transition passed.
+    pub applied_at: Nanos,
     pub gate: StfGate,
 }
 

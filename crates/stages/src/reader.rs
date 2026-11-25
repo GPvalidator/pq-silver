@@ -69,7 +69,7 @@ impl StageReader {
 
     /// A parked block is announced again from the replay that admits it, so
     /// only the first announcement is its arrival; the announcement whose
-    /// handling ran the transition carries its stamp.
+    /// handling ran the transition carries its stamp, which dates it.
     fn on_block_received(&mut self, m: &InternalMessage<BeaconStateEvent>) {
         let BeaconStateEvent::BlockReceived { slot, block_root, source, stage, stf, .. } =
             *m.data()
@@ -93,7 +93,7 @@ impl StageReader {
         }
         if let Some(stf) = stf {
             self.out.push(event(Stage::Validated, stf.validated_at));
-            self.out.push(event(Stage::StfDone { gate: stf.gate }, published));
+            self.out.push(event(Stage::StfDone { gate: stf.gate }, stf.applied_at));
         }
         if stage == BlockStage::Applied && !tracked.attestable {
             tracked.attestable = true;
@@ -234,8 +234,10 @@ mod tests {
         }
     }
 
+    /// The transition passes 2 ms after validation.
     fn stamp(validated_at: Nanos, gate: StfGate) -> Option<StfStamp> {
-        Some(StfStamp { validated_at, gate })
+        let applied_at = validated_at + Nanos::from_millis(2);
+        Some(StfStamp { validated_at, applied_at, gate })
     }
 
     fn parked(root: [u8; 32], slot: u64, source: BlockSource) -> BeaconStateEvent {
@@ -316,6 +318,7 @@ mod tests {
         assert_eq!(received.ts, at(2, 300), "arrival is the ingestion clock");
         assert!(matches!(received.stage, Stage::Received { source: BlockSource::Gossip }));
         assert_eq!(find(&reader.out, "validated").ts, at(2, 304), "the node's stamp");
+        assert_eq!(find(&reader.out, "stf_done").ts, at(2, 306), "the node's stamp");
         assert!(matches!(find(&reader.out, "stf_done").stage, Stage::StfDone {
             gate: StfGate::Now
         }));
@@ -326,7 +329,6 @@ mod tests {
         // The remaining stages are publish events of their message, so
         // each lands after the ingestion time it was built from.
         for (stage, ingested) in [
-            ("stf_done", at(2, 300)),
             ("attestable", at(2, 300)),
             ("el_sent", at(2, 300)),
             ("el_verdict", at(2, 520)),
@@ -379,8 +381,8 @@ mod tests {
         assert_eq!(stages(&reader.out), ["received", "validated", "stf_done", "attestable"]);
         assert_eq!(reader.out[0].ts, at(5, 400), "one arrival per root");
         assert_eq!(reader.out[1].ts, at(5, 3_102), "validated in the release's handling");
-        assert!(reader.out[2].ts > at(5, 3_100), "import is the release's publish");
-        assert_eq!(reader.out[2].ts, reader.out[3].ts, "ungated: one publish carries both");
+        assert_eq!(reader.out[2].ts, at(5, 3_104), "the transition's own clock");
+        assert!(reader.out[3].ts > at(5, 3_100), "import is the release's publish");
     }
 
     /// A gate held the import: the post-state lands with the held
@@ -403,8 +405,7 @@ mod tests {
             assert_eq!(stages(&reader.out), ["received", "validated", "stf_done", "attestable"]);
             assert_eq!(reader.out[0].ts, at(5, 400));
             assert!(matches!(reader.out[2].stage, Stage::StfDone { gate: g } if g == gate));
-            let stf_done = reader.out[2].ts;
-            assert!(stf_done > at(5, 400) && stf_done < at(5, 500), "the first held publish");
+            assert_eq!(reader.out[2].ts, at(5, 404), "the held handling's transition");
             assert!(reader.out[3].ts > at(5, 700), "the Applied publish");
         }
     }
