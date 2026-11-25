@@ -464,6 +464,9 @@ fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
     for (local, justified_source) in [(false, true), (true, true), (true, false)] {
         let (mut tile, mut gossip, _spine, mut adapter) =
             pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
+        // A frozen clock past the merge's 3 s wait, so the test does not race it.
+        let merge_open_ms = tile.ticker.slot_start(AGGREGATE_SLOT + 1).as_millis_u64() + 4_000;
+        tile.ticker.set_since_genesis_ms(merge_open_ms);
         adapter.consume(|_: LeanVmReq, _| {});
         // Every validator shares one key, so two votes would be one claim.
         let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
