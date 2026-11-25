@@ -2,9 +2,13 @@ use std::{collections::VecDeque, time::Instant};
 
 use flux::Timer;
 use lean_vm::{AggregateClaims, AggregateProof, lean_xmss::LeanXmssPublicKey};
+use silver_beacon_state_data::{ValidatorsView, pq::xmss_pubkey};
 use silver_common::Nanos;
 
-use crate::tile::pq_aggregation::Claim;
+use crate::{
+    stf::StarkClaims,
+    tile::pq_aggregation::{Claim, claim},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofVerdict {
@@ -59,6 +63,27 @@ impl LeanVmVerifier {
         let verdict = if valid { ProofVerdict::Valid } else { ProofVerdict::Invalid };
         self.verdicts.push_back((request_id, verdict));
         request_id
+    }
+
+    /// How many proofs `stark` collected from `data`, or `None` at the first
+    /// invalid one.
+    pub fn stark_proofs_valid(
+        &mut self,
+        stark: &StarkClaims,
+        data: &[u8],
+        validators: &ValidatorsView,
+    ) -> Option<usize> {
+        let mut proofs = 0;
+        for (signed, proof) in stark.proofs(data) {
+            let claims = signed.map(|(signer, message)| {
+                claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
+            });
+            if !self.judge(claims, proof) {
+                return None;
+            }
+            proofs += 1;
+        }
+        Some(proofs)
     }
 
     /// Whether `proof` proves exactly the set of `claims`.

@@ -42,7 +42,6 @@ use crate::{
         exit_pool::ExitPool,
         fork_data_roots::ForkDataRoots,
         gossip::BatchedVote,
-        gossip_proofs::GossipProofs,
         held_blocks::{HeldBlocks, StagedVerdict},
         leanvm_verifier::LeanVmVerifier,
         payload_attestation_pool::PayloadAttestationPool,
@@ -77,7 +76,6 @@ mod finalize;
 mod fork_choice;
 mod fork_data_roots;
 mod gossip;
-mod gossip_proofs;
 mod held_blocks;
 mod leanvm_verifier;
 mod orphan_pool;
@@ -292,7 +290,6 @@ pub struct BeaconStateTile {
     arrival_timers: ArrivalTimers,
     aggregator_subnets: AggregatorSubnets,
     leanvm_verifier: LeanVmVerifier,
-    gossip_proofs: GossipProofs,
     seen_proposer_preferences: SeenProposerPreferences,
     /// Resolved pending-buffer admission / eviction / fallback bounds.
     pending_bounds: PendingBounds,
@@ -397,7 +394,6 @@ impl BeaconStateTile {
             arrival_timers: ArrivalTimers::new(),
             aggregator_subnets: AggregatorSubnets::default(),
             leanvm_verifier: LeanVmVerifier::default(),
-            gossip_proofs: GossipProofs::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
             pending_bounds: syncing.pending,
             verify_weak_subjectivity,
@@ -962,7 +958,6 @@ impl BeaconStateTile {
         self.seen_aggregates.prune_before(floor);
         self.attestation_root_memo.prune_before(floor);
         self.pq_aggregator.prune_before(floor);
-        self.gossip_proofs.prune_before(floor);
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);

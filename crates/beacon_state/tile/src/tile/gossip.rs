@@ -1,7 +1,4 @@
-use std::{
-    fmt::{self, Display},
-    ops::Range,
-};
+use std::fmt::{self, Display};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
@@ -44,9 +41,7 @@ use super::{
     attestation_pool::{InsertOutcome, Participants},
     block::lookahead_proposer,
     fork_data_roots::ForkDataRoots,
-    gossip_proofs::AwaitingProofs,
     held_blocks::BlockSourceMsg,
-    leanvm_verifier::ProofVerdict,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
     pq_aggregation::{Aggregate, Claim, VerifiedVote, claim},
     seen_aggregates::Coverage,
@@ -2425,11 +2420,11 @@ impl BeaconStateTile {
         pin: &TRead,
         data: &[u8],
         producers: &mut Producers,
-    ) -> Option<Feedback> {
+    ) -> Feedback {
         if let Err(feedback) = self.precheck_pq_gossip(m.topic, data) {
-            return Some(feedback);
+            return feedback;
         }
-        let feedback = match m.topic {
+        match m.topic {
             GossipTopic::ProposerPreferences => self.handle_proposer_preferences(
                 data,
                 ForkName::Pq,
@@ -2448,18 +2443,9 @@ impl BeaconStateTile {
                 producers,
             ),
             GossipTopic::BeaconAggregateAndProof => self.handle_pq_aggregate(data),
-            GossipTopic::AttesterSlashing => {
-                let requests = match self.verify_pq_attester_slashing_proofs(data) {
-                    Ok(requests) => requests,
-                    Err(feedback) => return Some(feedback),
-                };
-                let slot = self.ticker.current_slot();
-                self.gossip_proofs.park(*m, pin.clone(), slot, requests);
-                return None;
-            }
+            GossipTopic::AttesterSlashing => self.handle_pq_attester_slashing(data),
             _ => Feedback::Ignore,
-        };
-        Some(feedback)
+        }
     }
 
     fn aggregate_state(&mut self, slot: Slot) -> StateId {
@@ -2646,52 +2632,26 @@ impl BeaconStateTile {
         Ok(())
     }
 
-    fn verify_pq_attester_slashing_proofs(
-        &mut self,
-        slashing: &[u8],
-    ) -> Result<Range<u64>, Feedback> {
-        if self.gossip_proofs.is_full() {
-            return Err(Feedback::Ignore);
-        }
-        let state_id = self.canonical_state_id();
-        let view = self.state.read_view(state_id);
+    fn handle_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {
+        let view = self.state.read_view(self.canonical_state_id());
         if !view.is_pq() {
-            return Err(Feedback::Ignore);
+            return Feedback::Ignore;
         }
         let seen = |vi| self.seen_attester_slashed.contains(vi);
         let claims = &mut self.stf_scratch.stark;
         match stf::validate_pq_attester_slashing_for_gossip(&view, slashing, seen, claims) {
             Ok(true) => {}
-            Ok(false) => return Err(Feedback::Ignore),
+            Ok(false) => return Feedback::Ignore,
             Err(e) => {
                 silver_log::debug!(error = %e, "attester_slashing gossip rejected");
-                return Err(Feedback::reject("attester slashing invalid"));
+                return Feedback::reject("attester slashing invalid");
             }
         }
-        Ok(self.verify_stark_proofs(slashing, state_id))
-    }
-
-    pub(super) fn settle_gossip_proofs(
-        &mut self,
-        awaiting: AwaitingProofs,
-        verdict: ProofVerdict,
-        producers: &mut Producers,
-    ) {
-        let AwaitingProofs { msg, pin, .. } = awaiting;
-        let Some(data) = pin.buffer().ok().map(|(data, _)| data) else {
-            return Self::local_verdict(&msg, Feedback::Ignore, producers);
-        };
-        let feedback = match verdict {
-            ProofVerdict::Invalid => Feedback::reject("STARK proof invalid"),
-            ProofVerdict::Valid => self.commit_pq_attester_slashing(data),
-        };
-        match feedback {
-            Feedback::Accept => {
-                Self::relay_gossip(&msg, None, producers);
-                self.publish_status(producers);
-            }
-            Feedback::Reject { reason, .. } => self.reject_gossip(&msg, data, reason, producers),
-            feedback => Self::local_verdict(&msg, feedback, producers),
+        let verifier = &mut self.leanvm_verifier;
+        match verifier.stark_proofs_valid(&self.stf_scratch.stark, slashing, &view.validators) {
+            Some(0) => Feedback::reject("attester slashing without a proof"),
+            Some(_) => self.commit_pq_attester_slashing(slashing),
+            None => Feedback::reject("STARK proof invalid"),
         }
     }
 
@@ -2797,10 +2757,7 @@ impl BeaconStateTile {
 
         let feedback = match m.topic {
             _ if m.domain.format() == ForkName::Pq && m.topic != GossipTopic::BeaconBlock => {
-                match self.handle_pq_gossip(&m, &acquired, data, producers) {
-                    Some(feedback) => feedback,
-                    None => return true,
-                }
+                self.handle_pq_gossip(&m, &acquired, data, producers)
             }
             GossipTopic::BeaconBlock if self.sync_target.is_syncing() => {
                 match self.parse_and_verify_block(data, pre_verified) {

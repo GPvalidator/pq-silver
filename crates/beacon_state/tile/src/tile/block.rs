@@ -564,7 +564,7 @@ impl BeaconStateTile {
         first..leanvm_verifier.next_request_id()
     }
 
-    /// Hands a verdict to the gossip message or the block waiting on it.
+    /// Hands a verdict to the block waiting on it.
     pub(super) fn settle_proof(
         &mut self,
         request_id: u64,
@@ -572,11 +572,7 @@ impl BeaconStateTile {
         producers: &mut Producers,
     ) {
         silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
-        if !self.gossip_proofs.awaits(request_id) {
-            self.handle_stark_verdict(request_id, verdict, producers);
-        } else if let Some(awaiting) = self.gossip_proofs.on_verdict(request_id, verdict) {
-            self.settle_gossip_proofs(awaiting, verdict, producers);
-        }
+        self.handle_stark_verdict(request_id, verdict, producers);
     }
 
     pub(super) fn handle_stark_verdict(
