@@ -8067,6 +8067,45 @@ mod pq_aggregator {
     }
 
     #[test]
+    fn a_delayed_leaf_starts_after_its_slots_block_arrives() {
+        let mut rig = Rig::new();
+        rig.tile.delay_pq_leaf_aggregation(Duration::from_millis(500));
+        rig.ready();
+        let start_ms = rig.tile.ticker.slot_start(SLOT).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(start_ms + 1_000);
+        rig.vote(1);
+        assert!(rig.requests().is_empty(), "no block yet");
+
+        rig.tile.pq_aggregator.on_block_arrived(SLOT, &rig.tile.ticker);
+        rig.tile.ticker.set_since_genesis_ms(start_ms + 1_499);
+        rig.vote(2);
+        assert!(rig.requests().is_empty());
+        rig.tile.ticker.set_since_genesis_ms(start_ms + 1_500);
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 2), "one batch holds both votes");
+    }
+
+    #[test]
+    fn a_delayed_leaf_without_a_block_starts_at_the_aggregation_cutoff() {
+        let mut rig = Rig::new();
+        rig.tile.delay_pq_leaf_aggregation(Duration::from_millis(500));
+        rig.ready();
+        let start_ms = rig.tile.ticker.slot_start(SLOT).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(start_ms + 1_000);
+        rig.vote(1);
+
+        let cutoff_ms = rig.tile.ticker.aggregation_cutoff(SLOT, 0).as_millis_u64();
+        rig.tile.ticker.set_since_genesis_ms(cutoff_ms - 1);
+        rig.send_next();
+        assert!(rig.requests().is_empty());
+        rig.tile.ticker.set_since_genesis_ms(cutoff_ms);
+        rig.send_next();
+        let request = rig.request();
+        assert!(rig.carries(&request, 1));
+    }
+
+    #[test]
     fn a_rolling_proof_starts_with_the_first_ended_slot() {
         let mut rig = Rig::new();
         rig.tile.enable_pq_rolling_aggregate();

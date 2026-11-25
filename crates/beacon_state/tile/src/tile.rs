@@ -415,6 +415,10 @@ impl BeaconStateTile {
         self.pq_aggregator.enable_rolling();
     }
 
+    pub fn delay_pq_leaf_aggregation(&mut self, delay: Duration) {
+        self.pq_aggregator.delay_leaves(delay);
+    }
+
     pub fn open_tcaches(&mut self) -> Result<(), TCacheError> {
         let bs = TileId::BeaconState;
         self.reader.open_forwarder(bs, TCacheId::ControlProcessing, TReadMode::Sliding)?;

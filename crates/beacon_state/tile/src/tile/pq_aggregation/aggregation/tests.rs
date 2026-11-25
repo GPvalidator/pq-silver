@@ -17,7 +17,7 @@ const DEADLINE: Nanos = Nanos::from_secs(8);
 
 fn leaf(deadline: Nanos, votes: u16) -> LeafAggregation {
     let data = [0; ATTESTATION_DATA_SIZE];
-    let mut leaf = LeafAggregation::new(data, MAX_VALIDATORS_PER_COMMITTEE, deadline);
+    let mut leaf = LeafAggregation::new(data, MAX_VALIDATORS_PER_COMMITTEE, Nanos(0), deadline);
     (0..votes).for_each(|tag| assert!(leaf.add(vote(tag))));
     leaf
 }

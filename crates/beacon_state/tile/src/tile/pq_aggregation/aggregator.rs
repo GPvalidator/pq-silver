@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, mem};
+use std::{cmp::Reverse, mem, time::Duration};
 
 use flux::{Timer, spine::SpineProducers};
 use rustc_hash::FxHashMap;
@@ -102,9 +102,14 @@ pub struct PqAggregator {
     changed: bool,
     /// By attestation slot.
     merges: FxHashMap<Slot, MergeAggregation>,
-    /// When the next merge opens unless a block opens it first. No event
-    /// marks that moment, so `send_next` watches the clock until then.
-    merge_opens: Option<Nanos>,
+    /// How long a slot's votes wait after its block arrives before they are
+    /// proved. `None`: they are proved as they arrive.
+    leaf_delay: Option<Nanos>,
+    /// The newest slot whose block arrived, and when.
+    block_arrived: Option<(Slot, Nanos)>,
+    /// When the next aggregation opens unless a block opens it first. No
+    /// event marks that moment, so `send_next` watches the clock until then.
+    next_opens: Option<Nanos>,
     /// The newest slot whose block is done with the leanVM sidecar.
     block_settled: Slot,
     /// `None`: a block gets only the merge of the newest slot it may
@@ -123,7 +128,9 @@ impl Default for PqAggregator {
         Self {
             leaves: FxHashMap::default(),
             merges: FxHashMap::default(),
-            merge_opens: None,
+            leaf_delay: None,
+            block_arrived: None,
+            next_opens: None,
             block_settled: 0,
             rolling: None,
             changed: false,
@@ -147,6 +154,42 @@ impl PqAggregator {
         self.rolling.is_some()
     }
 
+    /// Votes of a slot are proved `delay` after the slot's block arrives, so
+    /// that the first batch holds the votes the block released. Without a
+    /// block they are proved from their aggregation cutoff.
+    pub fn delay_leaves(&mut self, delay: Duration) {
+        self.leaf_delay = Some(Nanos::from_millis(delay.as_millis() as u64));
+    }
+
+    /// The block of `slot` passed its proposer signature check.
+    pub fn on_block_arrived(&mut self, slot: Slot, ticker: &SlotTicker) {
+        let Some(delay) = self.leaf_delay else { return };
+        if self.block_arrived.is_some_and(|(newest, _)| newest >= slot) {
+            return;
+        }
+        let now = ticker.since_genesis();
+        self.block_arrived = Some((slot, now));
+        let opens = now + delay;
+        (self.leaves.iter_mut())
+            .filter(|(leaf, _)| leaf.slot <= slot)
+            .for_each(|(_, leaf)| leaf.open_by(opens));
+        self.watch(opens);
+    }
+
+    /// When a leaf of `slot` made now starts proving.
+    fn leaf_opens(&self, slot: Slot, cutoff: Nanos) -> Nanos {
+        let Some(delay) = self.leaf_delay else { return Nanos(0) };
+        match self.block_arrived {
+            Some((newest, at)) if newest == slot => (at + delay).min(cutoff),
+            Some((newest, _)) if newest > slot => Nanos(0),
+            _ => cutoff,
+        }
+    }
+
+    fn watch(&mut self, opens: Nanos) {
+        self.next_opens = Some(self.next_opens.map_or(opens, |held| held.min(opens)));
+    }
+
     /// `last_position` is the last place a local aggregator of the vote's
     /// committee holds in its aggregation committee. Votes are taken until
     /// its cutoff and proved until its aggregate is due.
@@ -162,17 +205,20 @@ impl PqAggregator {
             );
             return;
         }
-        if ticker.since_genesis() >= ticker.aggregation_cutoff(leaf.slot, last_position) {
+        let cutoff = ticker.aggregation_cutoff(leaf.slot, last_position);
+        if ticker.since_genesis() >= cutoff {
             silver_log::debug!(slot = leaf.slot, "vote after the aggregation cutoff");
             return;
         }
+        let opens = self.leaf_opens(leaf.slot, cutoff);
+        self.watch(opens);
         // TODO: the aggregate due time stands in for the VC's pull. A VC that
         // pulls later gets a proof frozen at the due time. Consider ending on
         // the last local aggregator's pull instead.
         let deadline = ticker.pq_aggregate_due(leaf.slot, last_position);
         let aggregation = self.leaves.entry(leaf).or_insert_with(|| {
             let data = SingleAttestationPqView::data(vote.single);
-            LeafAggregation::new(*data.as_bytes(), vote.committee_len, deadline)
+            LeafAggregation::new(*data.as_bytes(), vote.committee_len, opens, deadline)
         });
         let (position, signature) =
             (vote.committee_position, SingleAttestationPqView::signature(vote.single));
@@ -203,7 +249,7 @@ impl PqAggregator {
         } else {
             ticker.slot_start(slot + 1) + Nanos(ticker.slot_start(1).0 / MERGE_WAIT_DIVISOR)
         };
-        self.merge_opens = Some(self.merge_opens.map_or(opens, |held| held.min(opens)));
+        self.watch(opens);
         let merge =
             (self.merges.entry(slot)).or_insert_with(|| MergeAggregation::new(opens, deadline));
         if !merge.add(aggregate) {
@@ -292,8 +338,8 @@ impl PqAggregator {
         producers: &mut Producers,
     ) {
         let now = ticker.since_genesis();
-        if self.merge_opens.is_some_and(|opens| now >= opens) {
-            self.merge_opens = None;
+        if self.next_opens.is_some_and(|opens| now >= opens) {
+            self.next_opens = None;
             self.changed = true;
         }
         if !self.changed || !self.leanvm.is_idle() {

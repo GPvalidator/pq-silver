@@ -199,6 +199,7 @@ impl BeaconStateTile {
         let parsed = match self.parse_and_verify_block(data, pre_verified) {
             Ok(parsed) => {
                 validated_at = Nanos::now();
+                self.pq_aggregator.on_block_arrived(slot, &self.ticker);
                 if parsed.relay_eligible {
                     send_gossip(parsed.block_root, producers);
                 }

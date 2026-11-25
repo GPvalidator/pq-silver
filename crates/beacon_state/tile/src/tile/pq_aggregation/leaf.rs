@@ -32,7 +32,9 @@ impl LeafKey {
 
 /// The votes of one committee for one attestation data, proved as a leaf.
 /// The best proof is the only proof, so a batch takes up to `MAX_SIGNATURES`.
+/// Proving starts at `opens`.
 pub(super) struct LeafAggregation {
+    opens: Nanos,
     committee_len: usize,
     data: [u8; ATTESTATION_DATA_SIZE],
     /// The committee position of each vote.
@@ -45,10 +47,15 @@ impl LeafAggregation {
     pub(super) fn new(
         data: [u8; ATTESTATION_DATA_SIZE],
         committee_len: usize,
+        opens: Nanos,
         deadline: Nanos,
     ) -> Self {
         let (positions, strategy) = (Vec::new(), ArrivalOrder::default());
-        Self { committee_len, data, positions, strategy, core: Aggregation::new(deadline) }
+        Self { opens, committee_len, data, positions, strategy, core: Aggregation::new(deadline) }
+    }
+
+    pub(super) fn open_by(&mut self, at: Nanos) {
+        self.opens = self.opens.min(at);
     }
 
     /// `false` for a position beyond the largest committee.
@@ -61,10 +68,10 @@ impl LeafAggregation {
         fits
     }
 
-    /// `None` when it has nothing to send: past its deadline, stopped, or no
-    /// waiting vote adds a position.
+    /// `None` when it has nothing to send: not yet open, past its deadline,
+    /// stopped, or no waiting vote adds a position.
     pub(super) fn priority(&self, now: Nanos) -> Option<Priority> {
-        self.core.priority(now, self.strategy.waiting())
+        (now >= self.opens).then(|| self.core.priority(now, self.strategy.waiting()))?
     }
 
     /// `None` exactly when `priority` is, unless the strategy has a bug.

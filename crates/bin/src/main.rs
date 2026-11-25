@@ -367,6 +367,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if config.pq_rolling_aggregate() {
         beacon_state_tile.enable_pq_rolling_aggregate();
     }
+    if let Some(delay) = config.pq_leaf_aggregation_delay() {
+        beacon_state_tile.delay_pq_leaf_aggregation(delay);
+    }
     let state_reader = beacon_state_tile.reader();
 
     let storage_tile = StorageTile::new(

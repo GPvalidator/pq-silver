@@ -242,6 +242,11 @@ pub struct Config {
     /// about two more leanVM sidecar proofs each slot.
     #[serde(default = "default_bool::<true>")]
     pq_rolling_aggregate: bool,
+    /// A local aggregator proves a slot's PQ votes this long after the slot's
+    /// block arrives. At 0 it proves them as they arrive. Without a block it
+    /// proves them from the aggregation cutoff.
+    #[serde(default = "default_u64::<1_000>")]
+    pq_leaf_aggregation_delay_ms: u64,
 }
 
 impl Config {
@@ -367,6 +372,11 @@ impl Config {
 
     pub fn pq_rolling_aggregate(&self) -> bool {
         self.pq_rolling_aggregate
+    }
+
+    pub fn pq_leaf_aggregation_delay(&self) -> Option<Duration> {
+        let delay_ms = self.pq_leaf_aggregation_delay_ms;
+        (delay_ms > 0).then(|| Duration::from_millis(delay_ms))
     }
 
     pub fn enr(&self, keypair: &Keypair, enr_fork_id: [u8; 16]) -> Result<Enr, Error> {
@@ -619,6 +629,16 @@ mod tests {
         let cfg = Config::from_toml("", flag).unwrap();
         assert_eq!(cfg.pbs().unwrap().get_header_timeout(), Duration::from_millis(1200));
         assert_eq!(cfg.pbs().unwrap().submit_blinded_block_timeout(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn pq_leaf_aggregation_waits_one_second_unless_the_file_says_otherwise() {
+        let delay = |toml| {
+            Config::from_toml(toml, Overrides::default()).unwrap().pq_leaf_aggregation_delay()
+        };
+        assert_eq!(delay(""), Some(Duration::from_secs(1)));
+        assert_eq!(delay("pq_leaf_aggregation_delay_ms = 250"), Some(Duration::from_millis(250)));
+        assert_eq!(delay("pq_leaf_aggregation_delay_ms = 0"), None);
     }
 
     #[test]
