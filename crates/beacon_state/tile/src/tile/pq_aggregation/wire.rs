@@ -138,14 +138,14 @@ pub(in crate::tile) struct AggregateResponse<'a> {
 }
 
 impl<'a> AggregateResponse<'a> {
-    /// A non-zero status logs the leanVM sidecar's message and fails.
+    /// A non-zero status logs the prover's message and fails.
     pub(super) fn decode(body: &'a [u8]) -> Result<Self, &'static str> {
         let (&status, mut rest) = body.split_first().ok_or("empty response")?;
         if status != 0 {
             let message = take_bytes(&mut rest).unwrap_or_default();
             let message = String::from_utf8_lossy(message);
-            silver_log::warn!(status, %message, "leanvm sidecar rejected the batch");
-            return Err("rejected by the leanvm sidecar");
+            silver_log::warn!(status, %message, "leanvm prover rejected the batch");
+            return Err("rejected by the leanvm prover");
         }
         Self::parse(rest).ok_or("malformed response")
     }
@@ -166,7 +166,7 @@ impl<'a> AggregateResponse<'a> {
         (sorted && no_sphincs_and_no_da && bytes.is_empty()).then_some(claims)
     }
 
-    /// A successful response body, as the leanVM sidecar writes it.
+    /// A successful response body, as the prover writes it.
     #[cfg(test)]
     pub(in crate::tile) fn encode(claims: &[Claim], proof: &[u8]) -> Vec<u8> {
         let mut body = vec![0; 1 + proof_len(claims.len(), proof.len())];

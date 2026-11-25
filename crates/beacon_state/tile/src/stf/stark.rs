@@ -6,8 +6,8 @@ use silver_common::ssz_view::AttestationDataView;
 use crate::stf::attestation::attester_signing_root;
 
 /// Spec `XMSSAggregateStatement`, its public keys held as validator indices
-/// into [`StarkClaims::signers`]. A leanVM sidecar claim carries no leaf
-/// index, so none is kept.
+/// into [`StarkClaims::signers`]. A leanVM claim carries no leaf index, so
+/// none is kept.
 struct Statement {
     message: B256,
     signers: Range<usize>,

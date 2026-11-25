@@ -1,7 +1,7 @@
-//! The leanVM sidecar's request and response bodies, kept byte for byte so
-//! `beacon_state` speaks to this tile as it spoke to the sidecar (leanVM
-//! `bins/leanvm-sidecar/README.md` at `bindings-v0.16.0`). Frames and the
-//! hello are gone: each body travels whole through a tcache. Every integer is
+//! The prover's request and response bodies. They keep the leanVM sidecar's
+//! format byte for byte (leanVM `bins/leanvm-sidecar/README.md` at
+//! `bindings-v0.16.0`), without its frames and hello: each body travels whole
+//! through a tcache. Every integer is
 //! little-endian; every variable-length field is a `u64` length, then its
 //! bytes.
 

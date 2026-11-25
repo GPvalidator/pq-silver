@@ -1,9 +1,8 @@
-//! The leanVM tile: proves in this process, as the leanVM sidecar did in its
-//! own, behind the same spine messages and `aggregate` bodies. Proofs are
+//! The leanVM tile: proves `aggregate` bodies in this process. Proofs are
 //! verified where they arrive, in `beacon_state`.
 //!
 //! [`LeanVmTile`] takes `LeanVmReq` bodies off the spine and answers each
-//! with a `LeanVmResp`, its body the sidecar's response (status byte
+//! with a `LeanVmResp`, its body the prover's response (status byte
 //! included), or `None` for no answer. `LeanVmHealthEvent` says the prover is
 //! ready.
 //!
@@ -205,9 +204,9 @@ fn start_prover(cores: &[usize]) {
 }
 
 /// A fresh process's first proofs are slower, touching memory the allocator
-/// then keeps. As the sidecar did, this pays for it before the first
-/// request: a discarded leaf over one blob, the one input that needs no key,
-/// and a full recursion over it, at the rate used in practice.
+/// then keeps. This pays for it before the first request: a discarded leaf
+/// over one blob, the one input that needs no key, and a full recursion over
+/// it, at the rate used in practice.
 fn warm_up() {
     let blobs = lean_vm::lean_da::BlobMatrix::build(&[[0; lean_vm::lean_da::BLOB_SYMBOLS]])
         .expect("one blob");
@@ -219,8 +218,7 @@ fn warm_up() {
         .expect("the warm-up's recursion proves");
 }
 
-/// The sidecar's response to an `aggregate` body. Proves on the calling
-/// thread.
+/// The response to an `aggregate` body. Proves on the calling thread.
 fn prove(body: &[u8]) -> Vec<u8> {
     let request = match wire::decode_aggregate(body) {
         Ok(request) => request,

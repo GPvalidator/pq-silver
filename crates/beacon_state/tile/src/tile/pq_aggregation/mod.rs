@@ -1,5 +1,5 @@
 //! Post-quantum aggregation: votes and aggregates proved into one growing
-//! proof by the leanVM sidecar, a separate process.
+//! proof by the leanVM tile.
 //!
 //! A leaf proves the votes of one committee for one attestation data. A
 //! merge proves the aggregates of one slot for the block body. Each extends

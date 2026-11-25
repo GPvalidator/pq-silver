@@ -49,7 +49,7 @@ impl BestProof {
     }
 }
 
-/// How much an aggregation wants the leanVM sidecar; the highest goes first.
+/// How much an aggregation wants the prover; the highest goes first.
 /// Fields compare in declaration order.
 ///
 /// A leaf of slot `S` ends when its last local aggregator's aggregate is due.
@@ -141,7 +141,7 @@ impl Aggregation {
         request
     }
 
-    /// Settles `batch` with the leanVM sidecar's response body, or `None`
+    /// Settles `batch` with the prover's response body, or `None`
     /// without an answer. The response's proof becomes the best proof only if
     /// it proves exactly the claims of the covered verified claims and the
     /// batch. A refusal counts as a failure.

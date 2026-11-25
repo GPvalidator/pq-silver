@@ -218,7 +218,7 @@ impl Rolling {
         self.rolled_through = Some(slot);
     }
 
-    /// Settles `job` with the leanVM sidecar's response body, or `None`
+    /// Settles `job` with the prover's response body, or `None`
     /// without an answer. The response's proof is adopted only if it proves
     /// exactly the claims the job asked for. A slot whose roll fails is not
     /// tried again.

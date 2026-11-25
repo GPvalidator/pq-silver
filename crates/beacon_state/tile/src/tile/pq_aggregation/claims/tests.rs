@@ -16,7 +16,7 @@ fn an_aggregate_reads_its_group_from_its_attestation() {
     let ssz = attestation_in(SLOT, 3, [1, 5, 2047]);
     let aggregate =
         Aggregate::new(&ssz, &[70, 80, 90], claims(&[9, 8, 7]), b"proof".to_vec()).unwrap();
-    assert_eq!(aggregate.claims, claims(&[7, 8, 9]), "sorted for the leanVM sidecar");
+    assert_eq!(aggregate.claims, claims(&[7, 8, 9]), "sorted for leanVM");
 
     let group = aggregate.group;
     assert_eq!(group.slot, SLOT);

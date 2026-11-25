@@ -1,7 +1,6 @@
 use super::*;
 
-/// The client's half, as the sidecar's own client wrote it, without the
-/// frame's length.
+/// The client's half of the format.
 pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     let mut out = vec![OP_AGGREGATE, request.log_inv_rate as u8];
     out.extend((request.children.len() as u64).to_le_bytes());

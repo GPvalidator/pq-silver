@@ -1819,7 +1819,7 @@ pub struct EngineHealthEvent {
     pub sync_status: ELSyncStatus,
 }
 
-/// A leanVM sidecar request body, op byte onwards and unframed.
+/// A leanVM tile request body, op byte onwards and unframed.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
 pub struct LeanVmReq {
@@ -1827,7 +1827,7 @@ pub struct LeanVmReq {
     pub body: TCacheRead,
 }
 
-/// A leanVM sidecar response body, status byte included. `None` is no answer.
+/// A leanVM tile response body, status byte included. `None` is no answer.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
 pub struct LeanVmResp {

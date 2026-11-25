@@ -365,7 +365,7 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     assert_eq!(voted_weight(&mut tile, late), MAX_EFFECTIVE_BALANCE);
     assert!(buffered(&tile).is_none(), "promoted once");
     adapter.consume(|_: LeanVmReq, _| requests += 1);
-    assert_eq!(requests, 1, "the leaf goes to the leanVM sidecar");
+    assert_eq!(requests, 1, "the leaf goes to the prover");
 }
 
 const AGGREGATE_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
@@ -456,8 +456,8 @@ impl PqAggregate {
     }
 }
 
-/// A proven aggregate goes to the leanVM sidecar again, as a merge, only
-/// when a validator registered here proposes the first block to include it.
+/// A proven aggregate goes to the prover again, as a merge, only when a
+/// validator registered here proposes the first block to include it.
 #[test]
 fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
     let key = SecretKey::new(&[7; 32]);

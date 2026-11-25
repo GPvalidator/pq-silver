@@ -19,8 +19,8 @@ use super::{
 };
 use crate::{counters::BeaconStateCounters, tile::Producers};
 
-/// A merge waits this fraction of the next slot for that slot's block to be
-/// verified: 3 s of 12 s, the attestation deadline.
+/// A merge waits this fraction of the next slot for that slot's block to
+/// import: 3 s of 12 s, the attestation deadline.
 const MERGE_WAIT_DIVISOR: u64 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,14 +38,14 @@ impl AggregationKey {
     }
 }
 
-/// What one request to the leanVM sidecar is for.
+/// What one request to the prover is for.
 enum Job {
     Batch(AggregationKey, Batch),
     Rolling(RollingJob),
 }
 
-/// The leanVM sidecar as the aggregator sees it: one request at a time, and
-/// none while it is down.
+/// The prover as the aggregator sees it: one request at a time, and none
+/// before it is ready.
 #[derive(Default)]
 enum LeanVm {
     #[default]
@@ -96,8 +96,8 @@ pub struct PqAggregator {
     /// When the next merge opens unless a block opens it first. No event
     /// marks that moment, so `send_next` watches the clock until then.
     merge_opens: Option<Nanos>,
-    /// The newest slot whose block is done with the leanVM sidecar.
-    block_settled: Slot,
+    /// The newest slot whose block imported.
+    block_imported: Slot,
     /// `None`: a block gets only the merge of the newest slot it may
     /// include.
     rolling: Option<Rolling>,
@@ -115,7 +115,7 @@ impl Default for PqAggregator {
             leaves: FxHashMap::default(),
             merges: FxHashMap::default(),
             merge_opens: None,
-            block_settled: 0,
+            block_imported: 0,
             rolling: None,
             changed: false,
             leanvm: LeanVm::default(),
@@ -177,8 +177,7 @@ impl PqAggregator {
     /// taken the merge in. A merge refuses it once it holds too many
     /// committees.
     ///
-    /// The merge is proved in the next slot, once that slot's block is done
-    /// with the leanVM sidecar, so that the merge does not delay the block.
+    /// The merge is proved in the next slot, once that slot's block imports.
     /// It stops waiting for a late block at the attestation deadline.
     pub fn add_aggregate(&mut self, aggregate: Aggregate, ticker: &SlotTicker) {
         BeaconStateCounters::PqMergeClaimsOffered.add(aggregate.claims.len() as u64);
@@ -189,7 +188,7 @@ impl PqAggregator {
             silver_log::debug!(slot, "aggregate after its slot's merge ended");
             return;
         }
-        let opens = if self.block_settled > slot {
+        let opens = if self.block_imported > slot {
             ticker.since_genesis()
         } else {
             ticker.slot_start(slot + 1) + Nanos(ticker.slot_start(1).0 / MERGE_WAIT_DIVISOR)
@@ -232,7 +231,7 @@ impl PqAggregator {
     }
 
     /// Drops the aggregations of slots before `floor`. The request in flight
-    /// for one still occupies the leanVM sidecar until its response arrives.
+    /// for one still occupies the prover until its response arrives.
     ///
     /// Called as slot `floor + 1` starts. The block of that slot may include
     /// the `POOL_SLOTS` slots up to `floor - 1`.
@@ -245,10 +244,9 @@ impl PqAggregator {
         self.changed = true;
     }
 
-    /// The block of `slot` was imported, rejected or dropped: its proofs no
-    /// longer wait on the leanVM sidecar. The merges of earlier slots open.
-    pub fn on_block_settled(&mut self, slot: Slot, ticker: &SlotTicker) {
-        self.block_settled = self.block_settled.max(slot);
+    /// The merges of slots before `slot` open.
+    pub fn on_block_imported(&mut self, slot: Slot, ticker: &SlotTicker) {
+        self.block_imported = self.block_imported.max(slot);
         let now = ticker.since_genesis();
         (self.merges.iter_mut())
             .filter(|(merged, _)| **merged < slot)
@@ -265,8 +263,8 @@ impl PqAggregator {
         }
     }
 
-    /// Sends a batch of the highest priority aggregation, if the leanVM
-    /// sidecar is idle. The tile calls it once per loop, after the events.
+    /// Sends a batch of the highest priority aggregation, if the prover is
+    /// idle. The tile calls it once per loop, after the events.
     ///
     /// It returns at once until an event changes state. A full tcache leaves
     /// `changed` set, so the next loop retries. It is not a failure.
@@ -308,8 +306,8 @@ impl PqAggregator {
         producers.produce(LeanVmReq { request_id, body });
     }
 
-    /// The next change to the rolling proof that needs the leanVM sidecar,
-    /// with its request written to `tcache`, or `None` for a full tcache.
+    /// The next change to the rolling proof that needs the prover, with its
+    /// request written to `tcache`, or `None` for a full tcache.
     /// Changes that need no proof are made here. It goes ahead of every
     /// batch: there are at most two a slot, and a proposal waits on them.
     ///

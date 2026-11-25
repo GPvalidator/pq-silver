@@ -6,7 +6,7 @@ use silver_common::{
 
 use super::strategy::{Committee, Positions};
 
-/// `pubkey | message`, so byte order is the leanVM sidecar's claim order.
+/// `pubkey | message`, so byte order is leanVM's claim order.
 pub type Claim = [u8; 64];
 
 pub fn claim(pubkey: &[u8; 32], message: &[u8; 32]) -> Claim {

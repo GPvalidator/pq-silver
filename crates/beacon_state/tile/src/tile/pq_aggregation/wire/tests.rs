@@ -135,5 +135,5 @@ fn a_rejection_is_an_error() {
     let mut body = vec![1];
     body.extend(le(3));
     body.extend(b"bad");
-    assert_eq!(AggregateResponse::decode(&body), Err("rejected by the leanvm sidecar"));
+    assert_eq!(AggregateResponse::decode(&body), Err("rejected by the leanvm prover"));
 }

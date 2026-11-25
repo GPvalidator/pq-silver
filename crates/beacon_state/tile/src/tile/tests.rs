@@ -7717,7 +7717,7 @@ mod pq_aggregator {
             sink.consume(|_: BeaconApiResponse, _| {});
             tile.consume_shared(&mut adapter);
             // The block of `SLOT` came 1 s in, so merges of earlier slots run.
-            tile.pq_aggregator.on_block_settled(SLOT, &tile.ticker);
+            tile.pq_aggregator.on_block_imported(SLOT, &tile.ticker);
             Self { tile, gossip, adapter, sink, _spine: spine }
         }
 
@@ -7787,10 +7787,10 @@ mod pq_aggregator {
             self.respond(request.request_id, &[[3; 64]]);
         }
 
-        /// The slot starts and its block is verified at once.
+        /// The slot starts and its block imports at once.
         fn start_slot(&mut self, slot: Slot) {
             self.start_slot_without_a_block(slot);
-            self.tile.pq_aggregator.on_block_settled(slot, &self.tile.ticker);
+            self.tile.pq_aggregator.on_block_imported(slot, &self.tile.ticker);
             self.send_next();
         }
 
@@ -7853,7 +7853,7 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_vote_sends_a_request_once_the_leanvm_sidecar_is_ready() {
+    fn a_vote_sends_a_request_once_the_prover_is_ready() {
         let mut rig = Rig::new();
         rig.vote_on(ROOT_A, 1);
         rig.vote_on(ROOT_B, 3);
@@ -7921,7 +7921,7 @@ mod pq_aggregator {
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64]]);
         rig.start_slot_without_a_block(SLOT + 1);
-        assert!(rig.requests().is_empty(), "the block may still need the leanVM sidecar");
+        assert!(rig.requests().is_empty(), "the block may not have imported yet");
 
         let deadline_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64() + 12_000 / 4;
         rig.tile.ticker.set_since_genesis_ms(deadline_ms - 1);
@@ -7934,14 +7934,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_merge_starts_as_soon_as_the_next_slots_block_is_settled() {
+    fn a_merge_starts_as_soon_as_the_next_slots_block_imports() {
         let mut rig = Rig::new();
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64]]);
         rig.start_slot_without_a_block(SLOT + 1);
         assert!(rig.requests().is_empty());
 
-        rig.tile.pq_aggregator.on_block_settled(SLOT + 1, &rig.tile.ticker);
+        rig.tile.pq_aggregator.on_block_imported(SLOT + 1, &rig.tile.ticker);
         rig.send_next();
         let request = rig.request();
         assert!(rig.carries(&request, 1));
@@ -8095,14 +8095,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_pruned_request_keeps_the_leanvm_sidecar_busy_until_its_response() {
+    fn a_pruned_request_keeps_the_prover_busy_until_its_response() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote(1);
         let stale = rig.request();
         rig.tile.pq_aggregator.prune_before(SLOT + 1);
         rig.aggregate(SLOT - 1, &[[9; 64]]);
-        assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
+        assert!(rig.requests().is_empty(), "the prover is still proving the old batch");
 
         rig.respond(stale.request_id, &[[1; 64]]);
         assert!(rig.served().is_none(), "the pruned leaf is gone");
