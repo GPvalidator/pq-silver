@@ -1334,6 +1334,7 @@ impl BeaconStateTile {
     /// Spec vectors stub XMSS, so every PQ signature and STARK proof passes.
     pub fn ef_stub_xmss(&mut self) {
         self.xmss_stubbed = true;
+        self.leanvm_verifier = LeanVmVerifier::fixed(true);
     }
 
     pub fn ef_tick(&mut self, since_genesis_ms: u64) {

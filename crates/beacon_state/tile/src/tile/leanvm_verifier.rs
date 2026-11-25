@@ -17,19 +17,22 @@ pub enum ProofVerdict {
 /// waits for [`Self::take_verdict`]: the caller first parks what waits on it.
 pub struct LeanVmVerifier {
     verified: u64,
-    claims: Vec<Claim>,
     verdicts: VecDeque<(u64, ProofVerdict)>,
-    duration: Timer,
+    judge: Judge,
+}
+
+enum Judge {
+    LeanVm { claims: Vec<Claim>, duration: Timer },
+    /// Spec vectors and tests carry no real proofs.
+    #[cfg(any(test, feature = "ef_tests"))]
+    Fixed(bool),
 }
 
 impl Default for LeanVmVerifier {
     fn default() -> Self {
-        Self {
-            verified: 0,
-            claims: Vec::new(),
-            verdicts: VecDeque::new(),
-            duration: Timer::new("silver", "leanvm_verify"),
-        }
+        let judge =
+            Judge::LeanVm { claims: Vec::new(), duration: Timer::new("silver", "leanvm_verify") };
+        Self { verified: 0, verdicts: VecDeque::new(), judge }
     }
 }
 
@@ -42,16 +45,37 @@ impl LeanVmVerifier {
         silver_log::info!(elapsed = ?started.elapsed(), "leanvm verifier ready");
     }
 
-    /// Judges whether `proof` proves exactly the set of `claims`.
+    #[cfg(any(test, feature = "ef_tests"))]
+    pub fn fixed(valid: bool) -> Self {
+        Self { verified: 0, verdicts: VecDeque::new(), judge: Judge::Fixed(valid) }
+    }
+
+    /// Judges whether `proof` proves exactly the set of `claims`, under the
+    /// id it returns.
     pub fn verify(&mut self, claims: impl IntoIterator<Item = Claim>, proof: &[u8]) -> u64 {
+        let valid = self.judge(claims, proof);
+        let request_id = self.next_request_id();
+        self.verified += 1;
+        let verdict = if valid { ProofVerdict::Valid } else { ProofVerdict::Invalid };
+        self.verdicts.push_back((request_id, verdict));
+        request_id
+    }
+
+    /// Whether `proof` proves exactly the set of `claims`.
+    pub fn judge(&mut self, claims: impl IntoIterator<Item = Claim>, proof: &[u8]) -> bool {
+        let (claims_buf, duration) = match &mut self.judge {
+            Judge::LeanVm { claims, duration } => (claims, duration),
+            #[cfg(any(test, feature = "ef_tests"))]
+            Judge::Fixed(valid) => return *valid,
+        };
         let started = Nanos::now();
-        self.claims.clear();
-        self.claims.extend(claims);
-        self.claims.sort_unstable();
-        self.claims.dedup();
-        debug_assert!(!self.claims.is_empty(), "leanVM has nothing to check against");
+        claims_buf.clear();
+        claims_buf.extend(claims);
+        claims_buf.sort_unstable();
+        claims_buf.dedup();
+        debug_assert!(!claims_buf.is_empty(), "leanVM has nothing to check against");
         // A key's bytes order as the key does, so the claims stay sorted.
-        let lean_xmss = self.claims.iter().map(|claim| {
+        let lean_xmss = claims_buf.iter().map(|claim| {
             let (pubkey, message) = claim.split_first_chunk::<32>().expect("64-byte claim");
             (LeanXmssPublicKey::from_bytes(pubkey), message.try_into().expect("64-byte claim"))
         });
@@ -61,13 +85,8 @@ impl LeanVmVerifier {
             da_commitment: None,
         };
         let valid = AggregateProof::from_bytes(proof).is_some_and(|proof| proof.verify(&claims));
-        self.duration.emit_latency_from_nanos(started, Nanos::now());
-
-        let request_id = self.next_request_id();
-        self.verified += 1;
-        let verdict = if valid { ProofVerdict::Valid } else { ProofVerdict::Invalid };
-        self.verdicts.push_back((request_id, verdict));
-        request_id
+        duration.emit_latency_from_nanos(started, Nanos::now());
+        valid
     }
 
     /// Ids go out in order, so the proofs verified between two calls form a

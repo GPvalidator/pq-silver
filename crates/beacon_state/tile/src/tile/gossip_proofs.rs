@@ -1,33 +1,16 @@
 use std::ops::Range;
 
-use silver_beacon_state_data::{AGGREGATORS_PER_COMMITTEE, B256, Epoch, Slot};
+use silver_beacon_state_data::{AGGREGATORS_PER_COMMITTEE, Slot};
 use silver_common::{NewGossipMsg, TRead};
 use silver_ssz::ssz_view::MAX_COMMITTEES_PER_SLOT_PQ;
 
-use super::{leanvm_verifier::ProofVerdict, pq_aggregation::Claim};
-use crate::stf::VoteTarget;
+use super::leanvm_verifier::ProofVerdict;
 
 const MAX_AWAITING: usize = 2 * MAX_COMMITTEES_PER_SLOT_PQ * AGGREGATORS_PER_COMMITTEE;
-
-pub(super) struct AggregateAwaitingProof {
-    pub target: VoteTarget,
-    pub attesters: Vec<u32>,
-    pub committee_index: u64,
-    pub data_root: B256,
-    pub aggregator_index: usize,
-    /// Its claims, when this node merges it into a block proof.
-    pub merge_claims: Option<Vec<Claim>>,
-}
-
-pub(super) enum GossipAwaitingProof {
-    Aggregate(AggregateAwaitingProof),
-    AttesterSlashing,
-}
 
 pub(super) struct AwaitingProofs {
     pub msg: NewGossipMsg,
     pub pin: TRead,
-    pub gossip: GossipAwaitingProof,
     parked_at: Slot,
     requests: Range<u64>,
     unverified: usize,
@@ -43,27 +26,16 @@ impl GossipProofs {
         self.awaiting.len() >= MAX_AWAITING
     }
 
-    pub(super) fn awaits_aggregator(&self, target_epoch: Epoch, aggregator_index: usize) -> bool {
-        self.awaiting.iter().any(|awaiting| match &awaiting.gossip {
-            GossipAwaitingProof::Aggregate(aggregate) => {
-                aggregate.target.target_epoch == target_epoch &&
-                    aggregate.aggregator_index == aggregator_index
-            }
-            GossipAwaitingProof::AttesterSlashing => false,
-        })
-    }
-
     pub(super) fn park(
         &mut self,
         msg: NewGossipMsg,
         pin: TRead,
-        gossip: GossipAwaitingProof,
         parked_at: Slot,
         requests: Range<u64>,
     ) {
         debug_assert!(!requests.is_empty() && !self.is_full());
         let unverified = (requests.end - requests.start) as usize;
-        self.awaiting.push(AwaitingProofs { msg, pin, gossip, parked_at, requests, unverified });
+        self.awaiting.push(AwaitingProofs { msg, pin, parked_at, requests, unverified });
     }
 
     pub(super) fn prune_before(&mut self, floor: Slot) {
