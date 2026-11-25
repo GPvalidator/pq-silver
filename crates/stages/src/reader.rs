@@ -328,11 +328,9 @@ mod tests {
 
         // The remaining stages are publish events of their message, so
         // each lands after the ingestion time it was built from.
-        for (stage, ingested) in [
-            ("attestable", at(2, 300)),
-            ("el_sent", at(2, 300)),
-            ("el_verdict", at(2, 520)),
-        ] {
+        for (stage, ingested) in
+            [("attestable", at(2, 300)), ("el_sent", at(2, 300)), ("el_verdict", at(2, 520))]
+        {
             let t = find(&reader.out, stage).ts;
             assert!(t > ingested, "{stage} at {t} must follow its ingestion {ingested}");
         }
@@ -390,24 +388,38 @@ mod tests {
     /// that follows; a re-fetch while held repeats neither.
     #[test]
     fn held_block_splits_stf_done_from_attestable() {
-        for (stage, gate) in
-            [(BlockStage::AwaitData, StfGate::Data), (BlockStage::AwaitVerify, StfGate::Verify)]
-        {
-            let mut reader = StageReader::default();
-            let root = [10u8; 32];
-            let held = |source, stf| block_received(root, 5, source, stage, stf);
+        let mut reader = StageReader::default();
+        let root = [10u8; 32];
+        let held = |source, stf| block_received(root, 5, source, BlockStage::AwaitData, stf);
 
-            let first = held(BlockSource::Gossip, stamp(at(5, 402), gate));
-            reader.on_beacon_state(&msg(first, at(5, 400)));
-            reader.on_beacon_state(&msg(held(BlockSource::Rpc, None), at(5, 500)));
-            reader.on_beacon_state(&msg(imported(root, 5, BlockSource::Gossip), at(5, 700)));
+        reader.on_beacon_state(&msg(
+            held(BlockSource::Gossip, stamp(at(5, 402), StfGate::Data)),
+            at(5, 400),
+        ));
+        reader.on_beacon_state(&msg(held(BlockSource::Rpc, None), at(5, 500)));
+        reader.on_beacon_state(&msg(imported(root, 5, BlockSource::Gossip), at(5, 700)));
 
-            assert_eq!(stages(&reader.out), ["received", "validated", "stf_done", "attestable"]);
-            assert_eq!(reader.out[0].ts, at(5, 400));
-            assert!(matches!(reader.out[2].stage, Stage::StfDone { gate: g } if g == gate));
-            assert_eq!(reader.out[2].ts, at(5, 404), "the held handling's transition");
-            assert!(reader.out[3].ts > at(5, 700), "the Applied publish");
-        }
+        assert_eq!(stages(&reader.out), ["received", "validated", "stf_done", "attestable"]);
+        assert_eq!(reader.out[0].ts, at(5, 400));
+        assert!(matches!(reader.out[2].stage, Stage::StfDone { gate: StfGate::Data }));
+        assert_eq!(reader.out[2].ts, at(5, 404), "the held handling's transition");
+        assert!(reader.out[3].ts > at(5, 700), "the Applied publish");
+    }
+
+    /// A PQ block verifies its proofs between its transition and its
+    /// import, so one announcement dates both ends of the verify.
+    #[test]
+    fn a_verified_block_dates_stf_done_and_attestable_apart() {
+        let mut reader = StageReader::default();
+        let root = [11u8; 32];
+        let stf = stamp(at(5, 402), StfGate::Verify);
+        let applied = block_received(root, 5, BlockSource::Gossip, BlockStage::Applied, stf);
+        reader.on_beacon_state(&msg(applied, at(5, 400)));
+
+        assert_eq!(stages(&reader.out), ["received", "validated", "stf_done", "attestable"]);
+        assert!(matches!(reader.out[2].stage, Stage::StfDone { gate: StfGate::Verify }));
+        assert_eq!(reader.out[2].ts, at(5, 404), "the transition's own clock");
+        assert!(reader.out[3].ts > at(5, 400), "import is the publish");
     }
 
     /// Without the stamp of the handling that ran the transition (a reader
@@ -428,8 +440,8 @@ mod tests {
             root,
             5,
             BlockSource::Gossip,
-            BlockStage::AwaitVerify,
-            stamp(at(5, 402), StfGate::Verify),
+            BlockStage::AwaitData,
+            stamp(at(5, 402), StfGate::Data),
         );
         reader.on_beacon_state(&msg(held, at(5, 400)));
         let rejected =

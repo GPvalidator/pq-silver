@@ -1503,8 +1503,6 @@ pub enum BlockStage {
     AwaitParent,
     /// State transition committed.
     AwaitData,
-    /// State transition committed; leanVM has yet to verify its STARK proofs.
-    AwaitVerify,
     Applied,
     AlreadyKnown,
 }
