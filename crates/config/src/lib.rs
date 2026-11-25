@@ -234,11 +234,10 @@ pub struct Config {
     suggested_fee_recipient: Option<[u8; 20]>,
     #[serde(default)]
     pbs: Option<PbsConfig>,
-    /// Cores of the leanVM prover: the leanVM tile's core first, then the
-    /// cores of its pool's other workers. Unset: every physical core after
-    /// the tiles' and the logger's. Empty: no prover.
+    /// How many cores the leanVM prover uses: the first physical cores after
+    /// the tiles' and the logger's. Unset: all of them. 0: no prover.
     #[serde(default)]
-    leanvm_cores: Option<Vec<usize>>,
+    leanvm_cores: Option<usize>,
     /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
     /// local proposal also includes votes older than the newest slot. Costs
     /// about two more leanVM proofs each slot.
@@ -264,8 +263,8 @@ impl Config {
                 None => self.pbs = Some(PbsConfig::new(endpoint)),
             }
         }
-        if let Some(cores) = overrides.leanvm_cores {
-            self.leanvm_cores = Some(cores);
+        if let Some(count) = overrides.leanvm_cores {
+            self.leanvm_cores = Some(count);
         }
     }
 }
@@ -278,7 +277,7 @@ pub struct Overrides {
     pub jwt_secret: Option<String>,
     pub unsafe_no_el: bool,
     pub pbs_endpoint: Option<String>,
-    pub leanvm_cores: Option<Vec<usize>>,
+    pub leanvm_cores: Option<usize>,
 }
 
 impl Config {
@@ -363,9 +362,9 @@ impl Config {
         self.pbs.as_ref()
     }
 
-    /// `None` when unset, for the default.
-    pub fn leanvm_cores(&self) -> Option<&[usize]> {
-        self.leanvm_cores.as_deref()
+    /// `None` when unset, for all of them.
+    pub fn leanvm_cores(&self) -> Option<usize> {
+        self.leanvm_cores
     }
 
     pub fn pq_rolling_aggregate(&self) -> bool {
@@ -634,13 +633,13 @@ mod tests {
     #[test]
     fn leanvm_cores_come_from_the_file_or_the_flag() {
         assert!(Config::from_toml("", Overrides::default()).unwrap().leanvm_cores().is_none());
-        let none = Config::from_toml("leanvm_cores = []", Overrides::default()).unwrap();
-        assert_eq!(none.leanvm_cores(), Some(&[][..]));
-        let toml = "leanvm_cores = [7, 8]";
+        let none = Config::from_toml("leanvm_cores = 0", Overrides::default()).unwrap();
+        assert_eq!(none.leanvm_cores(), Some(0));
+        let toml = "leanvm_cores = 4";
         let cfg = Config::from_toml(toml, Overrides::default()).unwrap();
-        assert_eq!(cfg.leanvm_cores(), Some(&[7, 8][..]));
-        let flag = Overrides { leanvm_cores: Some(vec![9]), ..Overrides::default() };
-        assert_eq!(Config::from_toml(toml, flag).unwrap().leanvm_cores(), Some(&[9][..]));
+        assert_eq!(cfg.leanvm_cores(), Some(4));
+        let flag = Overrides { leanvm_cores: Some(2), ..Overrides::default() };
+        assert_eq!(Config::from_toml(toml, flag).unwrap().leanvm_cores(), Some(2));
     }
 
     #[test]

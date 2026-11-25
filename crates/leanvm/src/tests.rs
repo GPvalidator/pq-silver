@@ -106,11 +106,11 @@ fn without_a_prover_every_request_is_answered_none() {
 
 /// Whatever the machine, one CPU per physical core, none below `first`.
 #[test]
-fn default_cores_take_one_thread_per_core_from_first_on() {
-    let all = super::default_cores(0);
+fn physical_cores_take_one_thread_per_core_from_first_on() {
+    let all = super::physical_cores(0);
     assert!(!all.is_empty());
     assert!(all.iter().all(|&cpu| super::first_sibling(cpu) == cpu));
-    let from_two = super::default_cores(2);
+    let from_two = super::physical_cores(2);
     assert!(from_two.iter().all(|&cpu| cpu >= 2 && all.contains(&cpu)));
 }
 

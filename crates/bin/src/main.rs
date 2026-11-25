@@ -68,7 +68,7 @@ const CONTROL_RPC_TCACHE_SIZE: usize = 1 << 20;
 /// on the one being written.
 const BEACON_STATE_TCACHE_SIZE: usize = 1 << 25;
 /// Tiles run on cores 1 to 6 and the logger on `LOG_CORE`; the leanVM
-/// prover takes the physical cores after them unless configured.
+/// prover takes the physical cores after them.
 const LEANVM_FIRST_CORE: usize = silver_log::LOG_CORE + 1;
 /// leanVM responses: a proof is at most 1 MiB, and `beacon_state` copies
 /// each out as it arrives.
@@ -429,12 +429,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         tile
     };
 
-    let leanvm_cores = match config.leanvm_cores() {
-        Some(cores) => cores.to_vec(),
-        None => silver_leanvm::default_cores(LEANVM_FIRST_CORE),
-    };
+    let mut leanvm_cores = silver_leanvm::physical_cores(LEANVM_FIRST_CORE);
+    if let Some(count) = config.leanvm_cores() {
+        if count > leanvm_cores.len() {
+            let free = leanvm_cores.len();
+            silver_log::warn!(count, free, "leanvm_cores asks for more cores than are free");
+        }
+        leanvm_cores.truncate(count);
+    }
     if leanvm_cores.is_empty() {
-        silver_log::warn!("no leanVM prover: set leanvm_cores for one");
+        silver_log::warn!("no leanVM prover: no free cores, or leanvm_cores = 0");
     } else {
         silver_log::info!(?leanvm_cores, "leanVM prover cores");
     }

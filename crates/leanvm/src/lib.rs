@@ -172,11 +172,11 @@ impl Prover {
     }
 }
 
-/// The default prover cores: one hardware thread per physical core this
-/// process may run on, from CPU `first` on. A core whose sibling thread lies
-/// below `first` is left out: a tile or the logger already runs there. The
-/// prover gains nothing from a second thread on a core.
-pub fn default_cores(first: usize) -> Vec<usize> {
+/// The cores the prover may use: one hardware thread per physical core this
+/// process may run on, from CPU `first` on, in order. A core whose sibling
+/// thread lies below `first` is left out: a tile or the logger already runs
+/// there. The prover gains nothing from a second thread on a core.
+pub fn physical_cores(first: usize) -> Vec<usize> {
     let allowed = flux::core_affinity::get_core_ids().unwrap_or_default();
     let mut cores: Vec<usize> = allowed
         .into_iter()
