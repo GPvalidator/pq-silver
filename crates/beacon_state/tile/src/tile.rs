@@ -1199,19 +1199,8 @@ impl BeaconStateTile {
         // Health first: a disconnect fails the batch in flight once, before
         // its `None` answer arrives.
         adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
-        adapter.consume(|resp: LeanVmResp, producers| {
-            if let Some(verdict) = self.leanvm_verifier.verdict(&resp, &mut self.reader) {
-                let request_id = resp.request_id;
-                silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
-                if !self.gossip_proofs.awaits(request_id) {
-                    self.handle_stark_verdict(request_id, verdict, producers);
-                } else if let Some(awaiting) = self.gossip_proofs.on_verdict(request_id, verdict) {
-                    self.settle_gossip_proofs(awaiting, verdict, producers);
-                }
-                return;
-            }
-            self.pq_aggregator.on_response(resp, &mut self.reader);
-        });
+        adapter
+            .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
             self.on_sidecar_bid(answer, producers);
@@ -1574,6 +1563,7 @@ impl Tile<SilverSpine> for BeaconStateTile {
             "the beacon_state tcache must hold a leanVM request of {MAX_REQUEST_LEN} bytes"
         );
         self.slashing_pool.with_producer(adapter.producers.beacon_events);
+        LeanVmVerifier::warm_up();
         true
     }
 
@@ -1589,6 +1579,11 @@ impl Tile<SilverSpine> for BeaconStateTile {
             self.following_loop(adapter)
         } else {
             self.syncing_loop(adapter)
+        }
+        // A settled proof may import a block whose own proofs then queue.
+        while let Some((request_id, verdict)) = self.leanvm_verifier.take_verdict() {
+            self.settle_proof(request_id, verdict, &mut adapter.producers);
+            adapter.mark_work();
         }
 
         if self.fork_choice.take_head_moved() {

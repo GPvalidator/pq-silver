@@ -6751,6 +6751,7 @@ dependencies = [
  "flux",
  "flux-profiler",
  "hex",
+ "lean_vm",
  "rand 0.8.6",
  "ring",
  "rustc-hash",

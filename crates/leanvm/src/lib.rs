@@ -1,5 +1,6 @@
-//! The leanVM tile: proves and verifies in this process, as the leanVM
-//! sidecar did in its own, behind the same spine messages and bodies.
+//! The leanVM tile: proves in this process, as the leanVM sidecar did in its
+//! own, behind the same spine messages and `aggregate` bodies. Proofs are
+//! verified where they arrive, in `beacon_state`.
 //!
 //! [`LeanVmTile`] takes `LeanVmReq` bodies off the spine and answers each
 //! with a `LeanVmResp`, its body the sidecar's response (status byte
@@ -8,26 +9,15 @@
 //!
 //! The tile's thread proves. leanVM's pool runs the thread that calls
 //! `aggregate` as its worker 0, so the tile's core is a prover core, and the
-//! pool's other workers run on the rest of the prover cores.
-//!
-//! A proof blocks the tile for its duration. Requests arriving during a proof
-//! are taken once it ends, and verdicts reached during it are published then.
-//! Verifies run on their own threads, one request each at a time. The sidecar
-//! answered verifies during a proof; this tile answers them after it.
+//! pool's other workers run on the rest of the prover cores. A proof blocks
+//! the tile for its duration: requests arriving during it are taken once it
+//! ends.
 
 #[cfg(test)]
 mod tests;
 mod wire;
 
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
-    },
-    thread,
-    time::Instant,
-};
+use std::{collections::VecDeque, time::Instant};
 
 use flux::{spine::SpineAdapter, tile::Tile, utils::try_thread_boot};
 use lean_vm::{AggregateProof, OutputClaims};
@@ -41,9 +31,6 @@ use wire::{Refusal, Rejection};
 /// keeps one in flight, so a full queue means it lost track; past it each
 /// request is answered `None`.
 const MAX_QUEUED_AGGREGATES: usize = 16;
-/// Verifies in flight, as the sidecar's 16 connections allowed. Past it each
-/// request is answered `None`.
-const MAX_VERIFIES: usize = 16;
 
 pub struct LeanVmTile {
     prover: Prover,
@@ -58,7 +45,7 @@ enum Prover {
     Off,
     /// The tile's core first. Starts in `try_init`, on the tile's thread.
     Cold(Vec<usize>),
-    Warm(Verifier),
+    Warm,
 }
 
 impl Tile<SilverSpine> for LeanVmTile {
@@ -73,7 +60,8 @@ impl Tile<SilverSpine> for LeanVmTile {
     fn try_init(&mut self, adapter: &mut SpineAdapter<SilverSpine>) -> bool {
         self.open_tcaches().expect("tcache wiring");
         if let Prover::Cold(cores) = &self.prover {
-            self.prover = Prover::Warm(start_prover(cores));
+            start_prover(cores);
+            self.prover = Prover::Warm;
             silver_log::info!("leanvm prover ready");
             adapter.set_ingestion_time(IngestionTime::now());
             adapter.produce(LeanVmHealthEvent { ready: true });
@@ -83,7 +71,6 @@ impl Tile<SilverSpine> for LeanVmTile {
 
     fn loop_body(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
         self.producer.loop_start();
-        self.collect_verdicts();
         self.intake(adapter);
         if let Some((request_id, body)) = self.aggregates.pop_front() {
             let response = prove(&body);
@@ -115,37 +102,31 @@ impl LeanVmTile {
         )
     }
 
-    /// Copies each request out of the tcache: a verify goes to the verify
-    /// threads, an aggregate to the queue.
+    /// Copies each request out of the tcache into the queue.
     fn intake(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
         // The previous pass drained the queue.
         self.reader.free();
         let Self { prover, reader, aggregates, answers, .. } = self;
         adapter.consume(|req: LeanVmReq, _| {
             let request_id = req.request_id;
-            let taken = prover.verifier().and_then(|verifier| {
-                let body = copy_body(reader, req)?;
-                if wire::is_verify(&body) {
-                    verifier.send(request_id, body)
-                } else if aggregates.len() < MAX_QUEUED_AGGREGATES {
-                    aggregates.push_back((request_id, body));
-                    Some(())
-                } else {
+            let queued = match prover {
+                Prover::Off | Prover::Cold(_) => false,
+                Prover::Warm if aggregates.len() == MAX_QUEUED_AGGREGATES => {
                     silver_log::warn!(request_id, "leanvm aggregate queue full");
-                    None
+                    false
                 }
-            });
-            if taken.is_none() {
+                Prover::Warm => match copy_body(reader, req) {
+                    Some(body) => {
+                        aggregates.push_back((request_id, body));
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if !queued {
                 answers.push(LeanVmResp { request_id, body: None });
             }
         });
-    }
-
-    fn collect_verdicts(&mut self) {
-        while let Some((request_id, response)) = self.prover.verifier().and_then(Verifier::try_recv)
-        {
-            self.answer(request_id, &response);
-        }
     }
 
     fn answer(&mut self, request_id: u64, response: &[u8]) {
@@ -159,15 +140,6 @@ impl LeanVmTile {
     fn publish(&mut self, adapter: &mut SpineAdapter<SilverSpine>) {
         for resp in self.answers.drain(..) {
             adapter.produce(resp);
-        }
-    }
-}
-
-impl Prover {
-    fn verifier(&mut self) -> Option<&mut Verifier> {
-        match self {
-            Self::Warm(verifier) => Some(verifier),
-            Self::Off | Self::Cold(_) => None,
         }
     }
 }
@@ -218,20 +190,18 @@ fn copy_body(reader: &mut TCacheReader, req: LeanVmReq) -> Option<Vec<u8>> {
     Some(body)
 }
 
-/// Starts leanVM's pool on `cores` and the verify threads beside it, then
-/// pins the calling thread back to `cores[0]` and warms the prover up.
+/// Starts leanVM's pool on `cores`, then pins the calling thread back to
+/// `cores[0]` and warms the prover up.
 ///
-/// The pool's workers and the verify threads inherit the calling thread's
-/// CPU set, so it spans every prover core while they start.
-fn start_prover(cores: &[usize]) -> Verifier {
+/// The pool's workers inherit the calling thread's CPU set, so it spans
+/// every prover core while they start.
+fn start_prover(cores: &[usize]) {
     let started = Instant::now();
     try_thread_boot(cores, None).expect("pin to the leanvm cores");
     lean_vm::setup(cores.len());
-    let verifier = Verifier::spawn(cores.len());
     try_thread_boot(&cores[..1], None).expect("pin to the leanvm tile core");
     warm_up();
     silver_log::info!(?cores, elapsed = ?started.elapsed(), "leanvm prover started");
-    verifier
 }
 
 /// A fresh process's first proofs are slower, touching memory the allocator
@@ -249,18 +219,8 @@ fn warm_up() {
         .expect("the warm-up's recursion proves");
 }
 
-/// The sidecar's response to a verify body.
-fn verify(body: &[u8]) -> Vec<u8> {
-    match wire::decode_verify(body) {
-        Ok((claims, proof)) => {
-            let valid = AggregateProof::from_bytes(proof).is_some_and(|p| p.verify(&claims));
-            wire::encode_verdict(valid).to_vec()
-        }
-        Err(refusal) => refuse(&refusal),
-    }
-}
-
-/// The sidecar's response to any other body. Proves on the calling thread.
+/// The sidecar's response to an `aggregate` body. Proves on the calling
+/// thread.
 fn prove(body: &[u8]) -> Vec<u8> {
     let request = match wire::decode_aggregate(body) {
         Ok(request) => request,
@@ -320,55 +280,4 @@ fn prove(body: &[u8]) -> Vec<u8> {
 fn refuse(refusal: &Refusal) -> Vec<u8> {
     silver_log::warn!(rejection = ?refusal.why, message = refusal.message, "leanvm request refused");
     refusal.encode()
-}
-
-/// The verify threads: each takes one request body at a time from a shared
-/// queue and sends back its response.
-struct Verifier {
-    jobs: Sender<(u64, Vec<u8>)>,
-    done: Receiver<(u64, Vec<u8>)>,
-    in_flight: usize,
-}
-
-impl Verifier {
-    fn spawn(threads: usize) -> Self {
-        let (jobs, queue) = mpsc::channel::<(u64, Vec<u8>)>();
-        let (results, done) = mpsc::channel();
-        let queue = Arc::new(Mutex::new(queue));
-        for index in 0..threads {
-            let (queue, results) = (queue.clone(), results.clone());
-            thread::Builder::new()
-                .name(format!("leanvm-verify-{index}"))
-                .spawn(move || {
-                    loop {
-                        // The guard drops at the statement's end, so the
-                        // others take jobs while this one verifies.
-                        let job = queue.lock().unwrap().recv();
-                        // Ends with the tile, which drops the sender.
-                        let Ok((request_id, body)) = job else { return };
-                        if results.send((request_id, verify(&body))).is_err() {
-                            return;
-                        }
-                    }
-                })
-                .expect("spawn a leanvm verify thread");
-        }
-        Self { jobs, done, in_flight: 0 }
-    }
-
-    fn send(&mut self, request_id: u64, body: Vec<u8>) -> Option<()> {
-        if self.in_flight == MAX_VERIFIES {
-            silver_log::warn!(request_id, "leanvm verifies all busy");
-            return None;
-        }
-        self.jobs.send((request_id, body)).ok()?;
-        self.in_flight += 1;
-        Some(())
-    }
-
-    fn try_recv(&mut self) -> Option<(u64, Vec<u8>)> {
-        let result = self.done.try_recv().ok()?;
-        self.in_flight -= 1;
-        Some(result)
-    }
 }

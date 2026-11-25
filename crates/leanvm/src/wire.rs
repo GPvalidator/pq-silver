@@ -12,7 +12,6 @@ use lean_vm::{
 };
 
 const OP_AGGREGATE: u8 = 1;
-const OP_VERIFY: u8 = 2;
 const OK: u8 = 0;
 
 const XMSS_RECORD: usize = lean_xmss::PUB_KEY_SIZE + lean_xmss::MESSAGE_LEN + lean_xmss::SIG_SIZE;
@@ -73,22 +72,6 @@ pub struct Request<'a> {
     /// `None` for every covered claim.
     pub output: Option<AggregateClaims>,
     pub log_inv_rate: usize,
-}
-
-/// The operation a body asks for, read without decoding the rest: a verify
-/// goes to the verify threads, an aggregate waits for the prover.
-pub fn is_verify(body: &[u8]) -> bool {
-    body.first() == Some(&OP_VERIFY)
-}
-
-/// A `verify` call: the claims, and their proof's bytes.
-pub fn decode_verify(body: &[u8]) -> Result<(AggregateClaims, &[u8]), Refusal> {
-    let mut c = Cursor(body);
-    c.op(OP_VERIFY)?;
-    let claims = c.claims().ok_or_else(|| Refusal::malformed("claims"))?;
-    let proof = c.bytes().ok_or_else(|| Refusal::malformed("proof"))?;
-    c.end()?;
-    Ok((claims, proof))
 }
 
 pub fn decode_aggregate(body: &[u8]) -> Result<Request<'_>, Refusal> {
@@ -156,11 +139,6 @@ pub fn encode_proven(claims: &AggregateClaims, proof: &[u8]) -> Vec<u8> {
     put_bytes(&mut out, &claims.to_bytes());
     put_bytes(&mut out, proof);
     out
-}
-
-/// A `verify` response: status 0 and whether the proof is valid.
-pub fn encode_verdict(valid: bool) -> [u8; 2] {
-    [OK, valid.into()]
 }
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {

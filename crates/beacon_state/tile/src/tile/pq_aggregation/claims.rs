@@ -92,8 +92,8 @@ pub struct Aggregate {
 impl Aggregate {
     /// `attestation` is an `AttestationPq` of one committee. `attesters` and
     /// `claims` are its voters, in committee order. The caller has verified
-    /// `proof` for `claims`: our own proof, or a received one that a leanVM
-    /// sidecar `verify` accepted. `None` for no voter, a proof above the size
+    /// `proof` for `claims`: our own proof, or a received one that
+    /// `LeanVmVerifier` accepted. `None` for no voter, a proof above the size
     /// bound, an `attestation` not of one committee, or voters that do not
     /// match its positions one for one.
     pub fn new(

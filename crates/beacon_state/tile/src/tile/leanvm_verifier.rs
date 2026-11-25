@@ -1,106 +1,82 @@
-use flux::{Timer, spine::SpineProducers};
-use silver_common::{LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheReader, TProducer};
+use std::{collections::VecDeque, time::Instant};
 
-use crate::tile::{
-    Producers,
-    pq_aggregation::{
-        Claim,
-        wire::{VerifyRequest, decode_verify_response},
-    },
-};
+use flux::Timer;
+use lean_vm::{AggregateClaims, AggregateProof, lean_xmss::LeanXmssPublicKey};
+use silver_common::Nanos;
 
-/// Set in every verify request's id, so its response is told apart from an
-/// aggregation's, whose ids count up from 0.
-const VERIFY_ID_BIT: u64 = 1 << 63;
+use crate::tile::pq_aggregation::Claim;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofVerdict {
     Valid,
     Invalid,
-    /// The leanVM sidecar did not judge the proof: it was down, the request
-    /// or its response did not fit or lapped in a tcache, or it refused the
-    /// request.
-    Unanswered,
 }
 
-/// Verify requests to the leanVM sidecar. Each is answered once, through
-/// [`Self::verdict`], under the id [`Self::send`] returned; the caller keeps
-/// what waits on it.
+/// Verifies leanVM proofs inline, on the tile's thread. Each proof is judged
+/// when [`Self::verify`] is called, under the id it returns, and its verdict
+/// waits for [`Self::take_verdict`]: the caller first parks what waits on it.
 pub struct LeanVmVerifier {
-    sent: u64,
+    verified: u64,
     claims: Vec<Claim>,
-    /// Each request awaiting its answer, and when it went out.
-    in_flight: Vec<(u64, Nanos)>,
-    round_trip: Timer,
+    verdicts: VecDeque<(u64, ProofVerdict)>,
+    duration: Timer,
 }
 
 impl Default for LeanVmVerifier {
     fn default() -> Self {
         Self {
-            sent: 0,
+            verified: 0,
             claims: Vec::new(),
-            in_flight: Vec::new(),
-            round_trip: Timer::new("silver", "leanvm_verify"),
+            verdicts: VecDeque::new(),
+            duration: Timer::new("silver", "leanvm_verify"),
         }
     }
 }
 
 impl LeanVmVerifier {
-    /// Asks whether `proof` proves exactly the set of `claims`. `None` when
-    /// the tcache has no room for the request.
-    pub fn send(
-        &mut self,
-        claims: impl IntoIterator<Item = Claim>,
-        proof: &[u8],
-        tcache: &mut TProducer,
-        producers: &mut Producers,
-    ) -> Option<u64> {
+    /// Builds leanVM's verifying program, so the first proof does not pay for
+    /// it. Decoding builds it: the proof's first field is sized by it.
+    pub fn warm_up() {
+        let started = Instant::now();
+        let _ = AggregateProof::from_bytes(&[0; 8]);
+        silver_log::info!(elapsed = ?started.elapsed(), "leanvm verifier ready");
+    }
+
+    /// Judges whether `proof` proves exactly the set of `claims`.
+    pub fn verify(&mut self, claims: impl IntoIterator<Item = Claim>, proof: &[u8]) -> u64 {
+        let started = Nanos::now();
         self.claims.clear();
         self.claims.extend(claims);
         self.claims.sort_unstable();
         self.claims.dedup();
         debug_assert!(!self.claims.is_empty(), "leanVM has nothing to check against");
-        let request = VerifyRequest { claims: &self.claims, proof };
-        let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
-            silver_log::error!(len = request.len(), "beacon_state tcache full; verify not sent");
-            return None;
+        // A key's bytes order as the key does, so the claims stay sorted.
+        let lean_xmss = self.claims.iter().map(|claim| {
+            let (pubkey, message) = claim.split_first_chunk::<32>().expect("64-byte claim");
+            (LeanXmssPublicKey::from_bytes(pubkey), message.try_into().expect("64-byte claim"))
+        });
+        let claims = AggregateClaims {
+            lean_xmss: lean_xmss.collect(),
+            lean_sphincs: vec![],
+            da_commitment: None,
         };
+        let valid = AggregateProof::from_bytes(proof).is_some_and(|proof| proof.verify(&claims));
+        self.duration.emit_latency_from_nanos(started, Nanos::now());
+
         let request_id = self.next_request_id();
-        self.sent += 1;
-        self.in_flight.push((request_id, Nanos::now()));
-        producers.produce(LeanVmReq { request_id, body });
-        Some(request_id)
+        self.verified += 1;
+        let verdict = if valid { ProofVerdict::Valid } else { ProofVerdict::Invalid };
+        self.verdicts.push_back((request_id, verdict));
+        request_id
     }
 
-    /// Ids go out in order, so the requests sent between two calls form a
+    /// Ids go out in order, so the proofs verified between two calls form a
     /// range.
     pub fn next_request_id(&self) -> u64 {
-        VERIFY_ID_BIT | self.sent
+        self.verified
     }
 
-    /// The verdict `resp` carries, if it answers a verify request.
-    pub fn verdict(
-        &mut self,
-        resp: &LeanVmResp,
-        reader: &mut TCacheReader,
-    ) -> Option<ProofVerdict> {
-        if resp.request_id & VERIFY_ID_BIT == 0 {
-            return None;
-        }
-        if let Some(at) = self.in_flight.iter().position(|&(id, _)| id == resp.request_id) {
-            let (_, sent) = self.in_flight.swap_remove(at);
-            if resp.body.is_some() {
-                self.round_trip.emit_latency_from_nanos(sent, Nanos::now());
-            }
-        }
-        let Some(body) = resp.body else { return Some(ProofVerdict::Unanswered) };
-        let acquired = reader.acquire(body);
-        let verdict = acquired.buffer().ok().map(|(body, _)| decode_verify_response(body));
-        // A lapping writer could tear the bytes into a different verdict.
-        let Some(verdict) = verdict.filter(|_| acquired.revalidate().is_ok()) else {
-            silver_log::error!(request_id = resp.request_id, "leanvm verify response unreadable");
-            return Some(ProofVerdict::Unanswered);
-        };
-        Some(verdict)
+    pub fn take_verdict(&mut self) -> Option<(u64, ProofVerdict)> {
+        self.verdicts.pop_front()
     }
 }

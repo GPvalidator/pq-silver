@@ -159,8 +159,6 @@ pub(super) enum VerifyProgress {
     Verified(StagedBlock),
     /// The proofs are part of the transition, so the block failed it.
     Rejected(StagedBlock),
-    /// Dropped, not rejected: the block may yet verify when re-delivered.
-    Unanswered(StagedBlock),
 }
 
 /// Every block held for a dependency, and what travels with it. Orphans wait on
@@ -284,7 +282,6 @@ impl HeldBlocks {
                 self.orphans.drop_children(&block_root);
                 VerifyProgress::Rejected(block)
             }
-            ProofVerdict::Unanswered => VerifyProgress::Unanswered(block),
         }
     }
 

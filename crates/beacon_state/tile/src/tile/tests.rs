@@ -5506,23 +5506,6 @@ fn stark_invalid_rejects_parked_block() {
     assert_eq!(rejected, [S_ROOT], "the peer that served it is told");
 }
 
-/// A proof leanVM never judged says nothing about the block, so a
-/// re-delivered copy runs again.
-#[test]
-fn stark_unanswered_drops_parked_block_without_rejecting_it() {
-    const S_ROOT: B256 = [0x05; 32];
-    let mut forks = ThreeForks::new();
-    let (_spine, mut adapter) = spine_adapter(&forks.tile);
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
-
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Unanswered, &mut adapter.producers);
-
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-    assert_eq!(forks.tile.held.rejected_reason(&S_ROOT), None);
-}
-
 /// A block parked on its verdict holds a committed state, so finalization
 /// re-anchors it like a staged block.
 #[test]
@@ -7760,42 +7743,58 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
 }
 
 mod leanvm_verifier {
-    use silver_common::{LeanVmReq, LeanVmResp};
+    use lean_vm::{OutputClaims, lean_xmss};
 
-    use super::*;
     use crate::tile::leanvm_verifier::{LeanVmVerifier, ProofVerdict};
 
-    /// A verify request goes out under an id whose response the verifier
-    /// claims, while an aggregation's id stays the aggregator's.
+    /// Each proof is judged when verified, and its verdict waits under the
+    /// id it returned, in order.
     #[test]
-    fn verify_request_is_answered_under_its_own_id() {
-        let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
-        let (mut tile, mut gossip, _rpc, mut spine, mut adapter) =
-            tile_with_producers_on(40, BeaconState::empty_test(0), spec);
-        let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
-        sink.consume(|_: LeanVmReq, _| {});
+    fn verdicts_wait_in_order_under_their_ids() {
+        let mut verifier = LeanVmVerifier::default();
+        let first = verifier.verify([[1; 64], [2; 64]], b"proof");
+        let second = verifier.verify([[2; 64], [1; 64], [1; 64]], &[]);
+        assert_eq!(second, first + 1);
+        assert_eq!(verifier.take_verdict(), Some((first, ProofVerdict::Invalid)));
+        assert_eq!(verifier.take_verdict(), Some((second, ProofVerdict::Invalid)));
+        assert_eq!(verifier.take_verdict(), None);
+    }
+
+    /// Claims in silver's form, `pubkey | message` in any order, judge a real
+    /// proof as leanVM's own claims do.
+    #[test]
+    #[ignore = "proves with the real prover"]
+    fn a_real_proof_verifies_against_its_claims_only() {
+        let message = [7; lean_xmss::MESSAGE_LEN];
+        let signed: Vec<_> = (0..3u8)
+            .map(|k| {
+                let (secret_key, public_key) = lean_xmss::key_gen(&[k; lean_xmss::SECRET_KEY_LEN]);
+                secret_key.prepare(7);
+                (public_key, message, lean_xmss::sign(&secret_key, &message, 7))
+            })
+            .collect();
+        let claims: Vec<[u8; 64]> = signed
+            .iter()
+            .rev()
+            .map(|(public_key, message, _)| {
+                let mut claim = [0; 64];
+                claim[..32].copy_from_slice(&public_key.to_bytes());
+                claim[32..].copy_from_slice(message);
+                claim
+            })
+            .collect();
+        lean_vm::setup(2);
+        let (proven, proof) =
+            lean_vm::aggregate(&[], signed, vec![], None, OutputClaims::All, 2).unwrap();
+        assert_eq!(proven.lean_xmss.len(), 3);
+        let proof = proof.to_bytes();
 
         let mut verifier = LeanVmVerifier::default();
-        let claims = [[1; 64], [2; 64]];
-        let tcache = &mut tile.events_producer;
-        let first = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
-        let second = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
-        assert_ne!(first, second);
-        let mut requests = Vec::new();
-        sink.consume(|request: LeanVmReq, _| requests.push(request));
-        assert_eq!(requests.iter().map(|r| r.request_id).collect::<Vec<_>>(), [first, second]);
-        assert_eq!(tile.events_producer.read_buffer(requests[0].body).unwrap()[0], 2, "verify op");
-
-        let mut answer = |request_id, body: Option<&[u8]>| {
-            let body = body.map(|body| {
-                gossip.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap()
-            });
-            verifier.verdict(&LeanVmResp { request_id, body }, &mut tile.reader)
-        };
-        assert_eq!(answer(first, Some(&[0, 1])), Some(ProofVerdict::Valid));
-        assert_eq!(answer(second, Some(&[0, 0])), Some(ProofVerdict::Invalid));
-        assert_eq!(answer(first, None), Some(ProofVerdict::Unanswered), "the sidecar went down");
-        assert_eq!(answer(0, Some(&[0, 1])), None, "an aggregation's response");
+        LeanVmVerifier::warm_up();
+        let all = verifier.verify(claims.iter().copied(), &proof);
+        let fewer = verifier.verify(claims[1..].iter().copied(), &proof);
+        assert_eq!(verifier.take_verdict(), Some((all, ProofVerdict::Valid)));
+        assert_eq!(verifier.take_verdict(), Some((fewer, ProofVerdict::Invalid)), "a claim short");
     }
 }
 

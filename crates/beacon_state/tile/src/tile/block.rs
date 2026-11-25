@@ -536,44 +536,47 @@ impl BeaconStateTile {
                 Feedback::AwaitData(block_root)
             }
             ImportGate::StarkVerdict(ssz, source) => {
-                match self.send_stark_proofs(data, applied.id, producers) {
-                    Some(requests) if requests.is_empty() => {
-                        self.import_block(parsed, applied, data, |event| producers.produce(event));
-                        Feedback::BlockImported(block_root)
-                    }
-                    Some(requests) => {
-                        let block = StagedBlock { parsed, applied, ssz, source, el_valid: false };
-                        self.held.park_for_verify(block, requests);
-                        Feedback::AwaitVerify(block_root)
-                    }
-                    None => {
-                        self.stf_scratch.votes.recycle(applied.votes);
-                        Feedback::Ignore
-                    }
+                let requests = self.verify_stark_proofs(data, applied.id);
+                if requests.is_empty() {
+                    self.import_block(parsed, applied, data, |event| producers.produce(event));
+                    Feedback::BlockImported(block_root)
+                } else {
+                    let block = StagedBlock { parsed, applied, ssz, source, el_valid: false };
+                    self.held.park_for_verify(block, requests);
+                    Feedback::AwaitVerify(block_root)
                 }
             }
         }
     }
 
-    /// Sends each STARK proof collected from `data`, before the next
-    /// collection reuses them: the ids they went out under, or `None` when
-    /// one did not fit in the tcache.
-    pub(super) fn send_stark_proofs(
-        &mut self,
-        data: &[u8],
-        state_id: StateId,
-        producers: &mut Producers,
-    ) -> Option<Range<u64>> {
-        let Self { state, stf_scratch, leanvm_verifier, events_producer, .. } = self;
+    /// Verifies each STARK proof collected from `data`, before the next
+    /// collection reuses them: the ids their verdicts come under.
+    pub(super) fn verify_stark_proofs(&mut self, data: &[u8], state_id: StateId) -> Range<u64> {
+        let Self { state, stf_scratch, leanvm_verifier, .. } = self;
         let validators = &state.read_view(state_id).validators;
         let first = leanvm_verifier.next_request_id();
         for (signed, proof) in stf_scratch.stark.proofs(data) {
             let claims = signed.map(|(signer, message)| {
                 claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
             });
-            leanvm_verifier.send(claims, proof, events_producer, producers)?;
+            leanvm_verifier.verify(claims, proof);
         }
-        Some(first..leanvm_verifier.next_request_id())
+        first..leanvm_verifier.next_request_id()
+    }
+
+    /// Hands a verdict to the gossip message or the block waiting on it.
+    pub(super) fn settle_proof(
+        &mut self,
+        request_id: u64,
+        verdict: ProofVerdict,
+        producers: &mut Producers,
+    ) {
+        silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
+        if !self.gossip_proofs.awaits(request_id) {
+            self.handle_stark_verdict(request_id, verdict, producers);
+        } else if let Some(awaiting) = self.gossip_proofs.on_verdict(request_id, verdict) {
+            self.settle_gossip_proofs(awaiting, verdict, producers);
+        }
     }
 
     pub(super) fn handle_stark_verdict(
@@ -598,14 +601,6 @@ impl BeaconStateTile {
                 self.stf_scratch.votes.recycle(block.applied.votes);
                 let source = block.source;
                 producers.produce(BeaconStateEvent::BlockRejected { block_root, source });
-            }
-            VerifyProgress::Unanswered(block) => {
-                silver_log::warn!(
-                    block = hex32(&block.parsed.block_root),
-                    "leanVM did not judge the block's STARK proofs; dropped"
-                );
-                self.pq_aggregator.on_block_settled(block.parsed.header.slot, &self.ticker);
-                self.stf_scratch.votes.recycle(block.applied.votes);
             }
         }
     }

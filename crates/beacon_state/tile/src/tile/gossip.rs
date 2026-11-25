@@ -2440,7 +2440,7 @@ impl BeaconStateTile {
                 producers,
             ),
             GossipTopic::BeaconAggregateAndProof => {
-                let (request_id, aggregate) = match self.send_pq_aggregate_proof(data, producers) {
+                let (request_id, aggregate) = match self.verify_pq_aggregate_proof(data) {
                     Ok(sent) => sent,
                     Err(feedback) => return Some(feedback),
                 };
@@ -2451,7 +2451,7 @@ impl BeaconStateTile {
                 return None;
             }
             GossipTopic::AttesterSlashing => {
-                let requests = match self.send_pq_attester_slashing_proofs(data, producers) {
+                let requests = match self.verify_pq_attester_slashing_proofs(data) {
                     Ok(requests) => requests,
                     Err(feedback) => return Some(feedback),
                 };
@@ -2501,10 +2501,9 @@ impl BeaconStateTile {
         data.source_epoch() == justified.epoch && *data.source_root() == justified.root
     }
 
-    fn send_pq_aggregate_proof(
+    fn verify_pq_aggregate_proof(
         &mut self,
         signed: &[u8],
-        producers: &mut Producers,
     ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
         let (state_id, mut aggregate) = self.check_pq_aggregate(signed)?;
         self.verify_pq_aggregator(signed, state_id, &aggregate)?;
@@ -2529,10 +2528,7 @@ impl BeaconStateTile {
         });
         let merge_claims = merges.then(|| claims.clone().collect());
         let proof = SignedAggregateAndProofPqView::proof(signed);
-        let request_id = self
-            .leanvm_verifier
-            .send(claims, proof, &mut self.events_producer, producers)
-            .ok_or(Feedback::Ignore)?;
+        let request_id = self.leanvm_verifier.verify(claims, proof);
         aggregate.merge_claims = merge_claims;
         Ok((request_id, aggregate))
     }
@@ -2654,10 +2650,9 @@ impl BeaconStateTile {
         Ok(())
     }
 
-    fn send_pq_attester_slashing_proofs(
+    fn verify_pq_attester_slashing_proofs(
         &mut self,
         slashing: &[u8],
-        producers: &mut Producers,
     ) -> Result<Range<u64>, Feedback> {
         if self.gossip_proofs.is_full() {
             return Err(Feedback::Ignore);
@@ -2677,7 +2672,7 @@ impl BeaconStateTile {
                 return Err(Feedback::reject("attester slashing invalid"));
             }
         }
-        self.send_stark_proofs(slashing, state_id, producers).ok_or(Feedback::Ignore)
+        Ok(self.verify_stark_proofs(slashing, state_id))
     }
 
     pub(super) fn settle_gossip_proofs(
@@ -2691,7 +2686,6 @@ impl BeaconStateTile {
             return Self::local_verdict(&msg, Feedback::Ignore, producers);
         };
         let feedback = match (verdict, gossip) {
-            (ProofVerdict::Unanswered, _) => Feedback::Ignore,
             (ProofVerdict::Invalid, _) => Feedback::reject("STARK proof invalid"),
             (ProofVerdict::Valid, GossipAwaitingProof::Aggregate(aggregate)) => {
                 self.commit_pq_aggregate(data, aggregate)

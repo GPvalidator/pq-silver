@@ -5,17 +5,14 @@
 use std::time::{Duration, Instant};
 
 use flux::{spine::SpineAdapter, tile::Tile};
-use lean_vm::{AggregateClaims, lean_xmss};
+use lean_vm::{AggregateClaims, AggregateProof, lean_xmss};
 use silver_common::{
     LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCache, TCacheId, TCacheProducer,
     TCacheReader, TCacheTable, TProducer, TReadMode, test_util::ShmemDir,
 };
 
 use super::LeanVmTile;
-use crate::wire::{
-    Request,
-    tests::{encode_request, encode_verify},
-};
+use crate::wire::{Request, tests::encode_request};
 
 struct Injector;
 impl Tile<SilverSpine> for Injector {
@@ -132,12 +129,12 @@ fn proven(response: &[u8]) -> (AggregateClaims, Vec<u8>) {
     (AggregateClaims::from_bytes(claims).unwrap(), proof.to_vec())
 }
 
-/// Four keys sign one message; the tile proves, then judges the proof
-/// against its claims and against one claim short, with verifies beside a
-/// second proof.
+/// Four keys sign one message; the tile proves two of them, then merges that
+/// proof with the other two. Each proof verifies against its claims, and not
+/// against one claim short.
 #[test]
 #[ignore = "proves with the real prover: set LEANVM_TEST_CORES"]
-fn the_tile_proves_and_verifies_as_the_sidecar_did() {
+fn the_tile_proves_as_the_sidecar_did() {
     let message = [7; lean_xmss::MESSAGE_LEN];
     let raw_lean_xmss: Vec<_> = (0..4u8)
         .map(|k| {
@@ -163,20 +160,20 @@ fn the_tile_proves_and_verifies_as_the_sidecar_did() {
     let (claims, proof) = proven(&rig.answer(1).expect("a response"));
     assert_eq!(claims.lean_xmss.len(), 2);
 
-    // One crank takes all three. The verifies run while the tile proves 2,
-    // and their verdicts are published once that proof ends.
     rig.request(
         2,
         &encode_request(&request(raw_lean_xmss[2..].to_vec(), vec![(claims.clone(), &proof)])),
     );
-    let mut fewer = claims.clone();
-    fewer.lean_xmss.pop();
-    rig.request(3, &encode_verify(&claims, &proof));
-    rig.request(4, &encode_verify(&fewer, &proof));
-    assert_eq!(rig.answer(3), Some(vec![0, 1]));
-    assert_eq!(rig.answer(4), Some(vec![0, 0]));
-    let (union, _) = proven(&rig.answer(2).expect("a response"));
+    let (union, merged) = proven(&rig.answer(2).expect("a response"));
     assert_eq!(union.lean_xmss.len(), 4);
+
+    for (claims, proof) in [(claims, proof), (union, merged)] {
+        let proof = AggregateProof::from_bytes(&proof).expect("a proof");
+        assert!(proof.verify(&claims));
+        let mut fewer = claims;
+        fewer.lean_xmss.pop();
+        assert!(!proof.verify(&fewer), "a claim short");
+    }
 
     rig.request(5, &[9]);
     assert_eq!(rig.answer(5).expect("a response")[0], 5, "malformed");

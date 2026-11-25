@@ -37,13 +37,6 @@ pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_verify(claims: &AggregateClaims, proof: &[u8]) -> Vec<u8> {
-    let mut out = vec![OP_VERIFY];
-    put_bytes(&mut out, &claims.to_bytes());
-    put_bytes(&mut out, proof);
-    out
-}
-
 fn request() -> Request<'static> {
     let xmss = (
         LeanXmssPublicKey::from_bytes(&[1; lean_xmss::PUB_KEY_SIZE]),
@@ -81,7 +74,6 @@ fn a_request_decodes_to_what_was_encoded() {
 #[test]
 fn truncations_and_trailing_bytes_are_refused() {
     let bytes = encode_request(&request());
-    assert!(!is_verify(&bytes));
     for len in 0..bytes.len() {
         assert!(decode_aggregate(&bytes[..len]).is_err(), "a prefix of {len} bytes decoded");
     }
@@ -105,19 +97,11 @@ fn counts_past_the_body_or_the_bounds_are_refused() {
     assert!(matches!(decode_aggregate(&bytes), Err(Refusal { why: Rejection::InvalidInput, .. })));
 }
 
-#[test]
-fn a_verify_request_decodes() {
-    let claims = request().output.unwrap();
-    let bytes = encode_verify(&claims, &[9, 9]);
-    assert!(is_verify(&bytes));
-    let decoded = decode_verify(&bytes).expect("a verify request");
-    assert_eq!(decoded, (claims, &[9, 9][..]));
-}
-
-/// Any body that is not a verify reaches the aggregate decoder.
+/// Verifies are `beacon_state`'s now: a verify body, like any other, is
+/// malformed.
 #[test]
 fn unknown_and_empty_bodies_are_malformed() {
-    for body in [&[7][..], &[]] {
+    for body in [&[7][..], &[2], &[]] {
         let refused = decode_aggregate(body);
         assert!(matches!(refused, Err(Refusal { why: Rejection::Malformed, .. })));
     }
@@ -133,5 +117,4 @@ fn responses_carry_status_then_fields() {
 
     let refused = Refusal { why: Rejection::InvalidInput, message: "no".into() }.encode();
     assert_eq!(refused, [&[1u8][..], &2u64.to_le_bytes(), b"no"].concat());
-    assert_eq!(encode_verdict(true), [OK, 1]);
 }
