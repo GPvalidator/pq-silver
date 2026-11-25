@@ -19,7 +19,7 @@ pub enum TCacheId {
 }
 
 impl TCacheId {
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = Self::LeanVmProcessing as usize + 1;
     pub const ALL: [Self; Self::COUNT] = [
         Self::NetworkIngress,
         Self::NetworkProcessing,
@@ -59,5 +59,3 @@ impl TCacheId {
         }
     }
 }
-
-const _: () = assert!(TCacheId::LeanVmProcessing as usize + 1 == TCacheId::COUNT);
