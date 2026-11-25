@@ -53,10 +53,9 @@ impl RxBatch {
         // One-time wiring: header fields and iovec pointers.
         // SAFETY: capacity is RX_BUF_SIZE on each slot; kernel writes fill
         // these bytes before we read them.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..RX_BATCH_MAX {
-            unsafe { bufs[i].set_len(RX_BUF_SIZE) };
-            batch.iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut _;
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            unsafe { buf.set_len(RX_BUF_SIZE) };
+            batch.iovecs[i].iov_base = buf.as_mut_ptr() as *mut _;
             batch.iovecs[i].iov_len = RX_BUF_SIZE;
 
             batch.hdrs[i].msg_hdr.msg_name = &mut batch.addrs[i] as *mut _ as *mut _;

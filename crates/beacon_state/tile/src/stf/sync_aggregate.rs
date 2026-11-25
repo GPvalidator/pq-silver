@@ -110,9 +110,7 @@ pub fn process_sync_aggregate(
     let sync_indices: [u32; SYNC_COMMITTEE_SIZE] = *longtail.sync_committees().indices();
 
     let mut proposer_reward_sum = 0u64;
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..SYNC_COMMITTEE_SIZE {
-        let vi = sync_indices[i];
+    for (i, vi) in sync_indices.into_iter().enumerate() {
         if (vi as usize) >= count {
             continue;
         }
