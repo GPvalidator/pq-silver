@@ -12,8 +12,7 @@ pub enum StfSpan {
     /// Post-state committed → import, while the block is held on its data
     /// columns.
     DaWait,
-    /// Post-state committed → leanVM's verdict on the block's attestation
-    /// proof; an instant when the block had nothing to send.
+    /// Transition done → import: the block's STARK proofs verify.
     PqVerify,
 }
 

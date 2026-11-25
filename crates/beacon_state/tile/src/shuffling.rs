@@ -34,8 +34,8 @@ impl Seed {
         let len = 32 + values.len() * 8;
         assert!(len <= input.len(), "at most two values");
         input[..32].copy_from_slice(&self.0);
-        for (chunk, value) in input[32..len].chunks_exact_mut(8).zip(values) {
-            chunk.copy_from_slice(&value.to_le_bytes());
+        for (chunk, value) in input[32..len].as_chunks_mut().0.iter_mut().zip(values) {
+            *chunk = value.to_le_bytes();
         }
         Self(sha256(&input[..len]))
     }

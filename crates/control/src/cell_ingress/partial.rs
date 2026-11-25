@@ -196,15 +196,11 @@ impl CellIngress {
         producers: &SilverSpineProducers,
     ) {
         let mut rows = parsed.rows;
-        for (cell, proof) in parsed
-            .cells
-            .chunks_exact(BYTES_PER_CELL)
-            .zip(parsed.proofs.chunks_exact(BYTES_PER_KZG_PROOF))
-        {
+        let cells = parsed.cells.as_chunks::<BYTES_PER_CELL>().0;
+        let proofs = parsed.proofs.as_chunks::<BYTES_PER_KZG_PROOF>().0;
+        for (cell, proof) in cells.iter().zip(proofs) {
             let row = rows.trailing_zeros() as usize;
             rows &= rows - 1;
-            let (cell, proof) =
-                (cell.try_into().expect("exact chunk"), proof.try_into().expect("exact chunk"));
             let key = CellKey { block_root: group.block_root, column: group.column as usize, row };
             if let Ok(Some(pending)) = self.stage_cell(key, cell, proof, now) {
                 if !self.partial_budget.cell(peer) {

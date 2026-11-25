@@ -40,7 +40,8 @@ pub(crate) fn post_beacon_committee_subscriptions(
     resp.submit(
         held * SlotSubnets::SIZE,
         |out| {
-            for (record, slot) in out.chunks_exact_mut(SlotSubnets::SIZE).zip(by_slot.held()) {
+            let records = out.as_chunks_mut::<{ SlotSubnets::SIZE }>().0;
+            for (record, slot) in records.iter_mut().zip(by_slot.held()) {
                 slot.encode(record);
             }
         },

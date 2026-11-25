@@ -36,16 +36,15 @@ impl RxBatch {
         }
         self.datagrams.clear();
 
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..RX_BATCH_MAX {
+        for (i, buf) in self.bufs.iter_mut().enumerate() {
             // First time init: slots not yet set_len'd still have len=0.
             // Subsequent rounds: used slots were reclaimed above; unused
             // slots still have RX_BUF_SIZE len from prior round.
-            if self.bufs[i].len() < RX_BUF_SIZE {
-                unsafe { self.bufs[i].set_len(RX_BUF_SIZE) };
+            if buf.len() < RX_BUF_SIZE {
+                unsafe { buf.set_len(RX_BUF_SIZE) };
             }
 
-            match socket.recv_from(&mut self.bufs[i]) {
+            match socket.recv_from(buf) {
                 Ok((len, remote)) => {
                     let unmapped_remote = match remote {
                         SocketAddr::V6(v6) => {

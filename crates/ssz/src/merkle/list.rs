@@ -107,7 +107,12 @@ pub trait FixedContainer {
     fn hash_list(merkleizer: impl Merkleizer, bytes: &[u8]) -> B256 {
         // `hash_list` here is the leaves-iterator primitive above, not this
         // method (an unqualified call can't reach an associated fn).
-        hash_list(merkleizer, bytes.chunks_exact(Self::SSZ_SIZE).map(Self::hash_tree_root))
+        #[expect(
+            clippy::chunks_exact_to_as_chunks,
+            reason = "stable Rust cannot take `Self::SSZ_SIZE` as a const generic argument"
+        )]
+        let elements = bytes.chunks_exact(Self::SSZ_SIZE);
+        hash_list(merkleizer, elements.map(Self::hash_tree_root))
     }
 }
 

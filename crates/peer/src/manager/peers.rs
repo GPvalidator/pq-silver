@@ -280,13 +280,15 @@ impl PeerManager {
             !waiters.is_empty()
         });
 
-        // Archive counters for reputation persistence.
+        #[expect(
+            clippy::drain_collect,
+            reason = "the connection slot retains its topic map capacity for reuse"
+        )]
+        let topic_stats = state.topic_stats.drain().collect();
         self.archived.insert(peer_id, ArchivedState {
             application_score: state.application_score,
             behaviour_penalty: state.behaviour_penalty,
-            // Drained, not taken: the slot keeps its capacity for the next
-            // connection.
-            topic_stats: state.topic_stats.drain().collect(),
+            topic_stats,
             archived_at: now,
         });
 

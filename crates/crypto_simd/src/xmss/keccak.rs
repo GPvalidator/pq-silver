@@ -33,15 +33,14 @@ pub(super) const RC: [u64; 24] = [
 pub fn keccak256(input: &[u8]) -> [u8; 32] {
     let mut state = [0u64; 25];
 
-    let mut blocks = input.chunks_exact(RATE);
-    for block in &mut blocks {
+    let (blocks, tail) = input.as_chunks::<RATE>();
+    for block in blocks {
         absorb(&mut state, block);
         permutation(&mut state);
     }
 
     // pad10*1 behind the 0x01 domain byte; both land in one byte when the tail is
     // RATE - 1 long.
-    let tail = blocks.remainder();
     let mut last = [0u8; RATE];
     last[..tail.len()].copy_from_slice(tail);
     last[tail.len()] ^= 0x01;
@@ -50,16 +49,15 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
     permutation(&mut state);
 
     let mut out = [0u8; 32];
-    for (lane, bytes) in state.iter().zip(out.chunks_exact_mut(8)) {
-        bytes.copy_from_slice(&lane.to_le_bytes());
+    for (lane, bytes) in state.iter().zip(out.as_chunks_mut().0) {
+        *bytes = lane.to_le_bytes();
     }
     out
 }
 
-fn absorb(state: &mut [u64; 25], block: &[u8]) {
-    debug_assert_eq!(block.len(), RATE);
-    for (lane, bytes) in state.iter_mut().zip(block.chunks_exact(8)) {
-        *lane ^= u64::from_le_bytes(bytes.try_into().unwrap());
+fn absorb(state: &mut [u64; 25], block: &[u8; RATE]) {
+    for (lane, bytes) in state.iter_mut().zip(block.as_chunks().0) {
+        *lane ^= u64::from_le_bytes(*bytes);
     }
 }
 

@@ -137,8 +137,10 @@ impl PmBsHarness {
         let engine_resp_p = TCache::producer(TCacheId::BoundaryProcessing, 1 << 24);
         let delivery_p = TCache::producer(TCacheId::StorageDelivery, 1 << 20);
         let columns_p = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+        let leanvm_p = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
         let bs_tcaches = TCacheTable::from_iter(
-            [&gossip_p, &rpc_p, &engine_resp_p, &delivery_p, &columns_p].map(|p| p.cache_ref()),
+            [&gossip_p, &rpc_p, &engine_resp_p, &delivery_p, &columns_p, &leanvm_p]
+                .map(|p| p.cache_ref()),
         );
 
         let handoff = TCache::producer(TCacheId::BeaconStateHandoff, 1 << 25);

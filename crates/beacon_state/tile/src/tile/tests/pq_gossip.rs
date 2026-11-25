@@ -6,7 +6,7 @@ use silver_beacon_state_data::{
     },
 };
 use silver_common::{
-    ForkName, GossipDomain, LeanVmHealthEvent, LeanVmReq, ProposerPreparation, SlotSubnets,
+    ForkName, GossipDomain, LeanVmReq, ProposerPreparation, SlotSubnets,
     compute_subnet_for_attestation,
     ssz_hash::hash_attestation_data,
     ssz_view::{
@@ -21,7 +21,7 @@ use silver_slashing::Selection;
 use silver_ssz::ssz_view::{AttestationPqView, SingleAttestationPqView};
 
 use super::*;
-use crate::tile::leanvm_verifier::ProofVerdict;
+use crate::tile::leanvm_verifier::LeanVmVerifier;
 
 const VALIDATORS: usize = 128;
 
@@ -337,7 +337,7 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     }
     .encode(&mut subscription);
     tile.aggregator_subnets.record(&subscription);
-    tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+    tile.pq_aggregator.on_prover_ready();
 
     let msg = pq_gossip_msg(&tile, &mut gossip, &bytes, GossipTopic::BeaconAttestation(subnet));
     tile.on_gossip(msg, &mut adapter.producers);
@@ -365,7 +365,7 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     assert_eq!(voted_weight(&mut tile, late), MAX_EFFECTIVE_BALANCE);
     assert!(buffered(&tile).is_none(), "promoted once");
     adapter.consume(|_: LeanVmReq, _| requests += 1);
-    assert_eq!(requests, 1, "the leaf goes to the leanVM sidecar");
+    assert_eq!(requests, 1, "the leaf goes to the prover");
 }
 
 const AGGREGATE_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
@@ -456,14 +456,17 @@ impl PqAggregate {
     }
 }
 
-/// A proven aggregate goes to the leanVM sidecar again, as a merge, only
-/// when a validator registered here proposes the first block to include it.
+/// A proven aggregate goes to the prover again, as a merge, only when a
+/// validator registered here proposes the first block to include it.
 #[test]
 fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
     let key = SecretKey::new(&[7; 32]);
     for (local, justified_source) in [(false, true), (true, true), (true, false)] {
         let (mut tile, mut gossip, _spine, mut adapter) =
             pq_tile(&key.public_key(), 0, AGGREGATE_SLOT + 1);
+        // A frozen clock past the merge's 3 s wait, so the test does not race it.
+        let merge_open_ms = tile.ticker.slot_start(AGGREGATE_SLOT + 1).as_millis_u64() + 4_000;
+        tile.ticker.set_since_genesis_ms(merge_open_ms);
         adapter.consume(|_: LeanVmReq, _| {});
         // Every validator shares one key, so two votes would be one claim.
         let mut aggregate = PqAggregate::of_committee_zero_votes(&mut tile, 1);
@@ -484,13 +487,11 @@ fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
 
         let signed = &aggregate.signed;
         let msg = pq_gossip_msg(&tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
-        let request_id = tile.leanvm_verifier.next_request_id();
+        tile.leanvm_verifier = LeanVmVerifier::Fixed(true);
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
-        let awaiting = tile.gossip_proofs.on_verdict(request_id, ProofVerdict::Valid).unwrap();
-        tile.settle_gossip_proofs(awaiting, ProofVerdict::Valid, &mut adapter.producers);
         adapter.consume(|_: LeanVmReq, _| {});
 
-        tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+        tile.pq_aggregator.on_prover_ready();
         let tcache = &mut tile.events_producer;
         tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
         let mut merges = 0;
@@ -508,35 +509,31 @@ fn aggregate_counts_only_once_signed_and_proven() {
     let mut aggregate = PqAggregate::of_committee_zero(&mut tile);
     let mut send = |tile: &mut BeaconStateTile, adapter: &mut SpineAdapter<_>, signed: &[u8]| {
         let msg = pq_gossip_msg(tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
-        let request_id = tile.leanvm_verifier.next_request_id();
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
-        (tile.gossip_proofs.awaits(request_id).then_some(request_id), gossip_verdicts(adapter))
+        gossip_verdicts(adapter)
     };
 
+    tile.leanvm_verifier = LeanVmVerifier::Fixed(true);
     aggregate.sign(&key, LeafOffset::BeaconProposer);
     let sent = send(&mut tile, &mut adapter, &aggregate.signed);
-    assert_eq!(sent, (None, (0, 1)), "signed at another duty's leaf");
+    assert_eq!(sent, (0, 1), "signed at another duty's leaf");
 
     aggregate.sign(&key, LeafOffset::AggregateAndProof);
-    for (verdict, counted) in [(ProofVerdict::Invalid, false), (ProofVerdict::Valid, true)] {
-        let (request_id, verdicts) = send(&mut tile, &mut adapter, &aggregate.signed);
-        let request_id = request_id.expect("parked until its proof is judged");
-        assert_eq!(verdicts, (0, 0));
-        let resent = send(&mut tile, &mut adapter, &aggregate.signed);
-        assert_eq!(resent, (None, (0, 0)), "already awaiting a proof");
-
-        let awaiting = tile.gossip_proofs.on_verdict(request_id, verdict).unwrap();
-        tile.settle_gossip_proofs(awaiting, verdict, &mut adapter.producers);
-        assert_eq!(gossip_verdicts(&mut adapter), if counted { (1, 0) } else { (0, 1) });
-        assert_eq!(tile.seen_aggregators.contains(2, aggregate.aggregator), counted);
-        let weight = if counted { aggregate.attesters * MAX_EFFECTIVE_BALANCE } else { 0 };
+    for valid in [false, true] {
+        tile.leanvm_verifier = LeanVmVerifier::Fixed(valid);
+        let verdicts = send(&mut tile, &mut adapter, &aggregate.signed);
+        assert_eq!(verdicts, if valid { (1, 0) } else { (0, 1) });
+        assert_eq!(tile.seen_aggregators.contains(2, aggregate.aggregator), valid);
+        let weight = if valid { aggregate.attesters * MAX_EFFECTIVE_BALANCE } else { 0 };
         assert_eq!(voted_weight(&mut tile, aggregate.block_root), weight);
     }
+    let resent = send(&mut tile, &mut adapter, &aggregate.signed);
+    assert_eq!(resent, (0, 0), "already seen");
 
     aggregate.signed[SOURCE_ROOT_AT] ^= 1;
     aggregate.sign(&key, LeafOffset::AggregateAndProof);
     let second = send(&mut tile, &mut adapter, &aggregate.signed);
-    assert_eq!(second, (None, (0, 0)), "aggregator already seen");
+    assert_eq!(second, (0, 0), "aggregator already seen");
 }
 
 /// A PQ envelope that arrives before its block parks only once its signer's

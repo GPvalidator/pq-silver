@@ -1,7 +1,7 @@
 use crate::{
     merkle::{B256, ZERO_HASH, hash_fixed_bytes, hash_list, merkleize, uint64_chunk},
     progressive::{ProgressiveContainer, ProgressiveHasher, packed_active_fields},
-    ssz_view::{ExecutionPayloadBidView, SignedExecutionPayloadBidView},
+    ssz_view::{BYTES_PER_KZG_COMMITMENT, ExecutionPayloadBidView, SignedExecutionPayloadBidView},
 };
 
 impl ProgressiveContainer for ExecutionPayloadBidView {
@@ -19,8 +19,11 @@ impl ExecutionPayloadBidView {
         fee_recipient[..20].copy_from_slice(Self::fee_recipient(msg));
         let blob_off = u32::from_le_bytes(msg[188..192].try_into().unwrap()) as usize;
         let blob_bytes = if blob_off <= msg.len() { &msg[blob_off..] } else { &[] };
-        let blob_commitments =
-            hash_list(ProgressiveHasher::new(), blob_bytes.chunks_exact(48).map(hash_fixed_bytes));
+        let commitments = blob_bytes.as_chunks::<BYTES_PER_KZG_COMMITMENT>().0;
+        let blob_commitments = hash_list(
+            ProgressiveHasher::new(),
+            commitments.iter().map(|commitment| hash_fixed_bytes(commitment)),
+        );
 
         let fields = [
             *Self::parent_block_hash(msg),

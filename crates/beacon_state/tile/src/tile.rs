@@ -42,7 +42,6 @@ use crate::{
         exit_pool::ExitPool,
         fork_data_roots::ForkDataRoots,
         gossip::BatchedVote,
-        gossip_proofs::GossipProofs,
         held_blocks::{HeldBlocks, StagedVerdict},
         leanvm_verifier::LeanVmVerifier,
         payload_attestation_pool::PayloadAttestationPool,
@@ -77,7 +76,6 @@ mod finalize;
 mod fork_choice;
 mod fork_data_roots;
 mod gossip;
-mod gossip_proofs;
 mod held_blocks;
 mod leanvm_verifier;
 mod orphan_pool;
@@ -116,8 +114,6 @@ pub enum Feedback {
         block_root: B256,
     },
     AwaitData(B256),
-    /// Applied, and out of fork choice until leanVM verifies its STARK proofs.
-    AwaitVerify(B256),
     AwaitParentPayload {
         parent_root: B256,
         block_root: B256,
@@ -151,7 +147,6 @@ impl Debug for Feedback {
                 hex32(block_root)
             ),
             Self::AwaitData(r) => write!(f, "AwaitData(0x{})", hex32(r)),
-            Self::AwaitVerify(r) => write!(f, "AwaitVerify(0x{})", hex32(r)),
             Self::AwaitParentPayload { parent_root, block_root } => write!(
                 f,
                 "AwaitPayload(parent=0x{}, block=0x{})",
@@ -292,7 +287,6 @@ pub struct BeaconStateTile {
     arrival_timers: ArrivalTimers,
     aggregator_subnets: AggregatorSubnets,
     leanvm_verifier: LeanVmVerifier,
-    gossip_proofs: GossipProofs,
     seen_proposer_preferences: SeenProposerPreferences,
     /// Resolved pending-buffer admission / eviction / fallback bounds.
     pending_bounds: PendingBounds,
@@ -397,7 +391,6 @@ impl BeaconStateTile {
             arrival_timers: ArrivalTimers::new(),
             aggregator_subnets: AggregatorSubnets::default(),
             leanvm_verifier: LeanVmVerifier::default(),
-            gossip_proofs: GossipProofs::default(),
             seen_proposer_preferences: SeenProposerPreferences::default(),
             pending_bounds: syncing.pending,
             verify_weak_subjectivity,
@@ -426,6 +419,7 @@ impl BeaconStateTile {
         )?;
         self.reader.declare(TCacheId::BoundaryProcessing, &[TileId::Control]);
         self.reader.open(TCacheId::StorageDelivery, "bs_storage_delivery", TReadMode::Sliding)?;
+        self.reader.open(TCacheId::LeanVmProcessing, "bs_leanvm_processing", TReadMode::Sliding)?;
         self.reader.open(TCacheId::ControlSlot, "bs_control_slot", TReadMode::Strict)
     }
 
@@ -961,7 +955,6 @@ impl BeaconStateTile {
         self.seen_aggregates.prune_before(floor);
         self.attestation_root_memo.prune_before(floor);
         self.pq_aggregator.prune_before(floor);
-        self.gossip_proofs.prune_before(floor);
         self.payload_bids_pool.on_slot(slot);
         self.seen_proposer_preferences.on_slot(slot);
         self.envelope_arrivals.on_slot(slot);
@@ -1195,22 +1188,9 @@ impl BeaconStateTile {
             self.handle_engine_response(eng_resp, producers);
         });
 
-        // Health first: a disconnect fails the batch in flight once, before
-        // its `None` answer arrives.
-        adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
-        adapter.consume(|resp: LeanVmResp, producers| {
-            if let Some(verdict) = self.leanvm_verifier.verdict(&resp, &mut self.reader) {
-                let request_id = resp.request_id;
-                silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
-                if !self.gossip_proofs.awaits(request_id) {
-                    self.handle_stark_verdict(request_id, verdict, producers);
-                } else if let Some(awaiting) = self.gossip_proofs.on_verdict(request_id, verdict) {
-                    self.settle_gossip_proofs(awaiting, verdict, producers);
-                }
-                return;
-            }
-            self.pq_aggregator.on_response(resp, &mut self.reader);
-        });
+        adapter.consume(|_: LeanVmHealthEvent, _| self.pq_aggregator.on_prover_ready());
+        adapter
+            .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
 
         adapter.consume(|answer: SidecarBidResponse, producers| {
             self.on_sidecar_bid(answer, producers);
@@ -1344,6 +1324,7 @@ impl BeaconStateTile {
     /// Spec vectors stub XMSS, so every PQ signature and STARK proof passes.
     pub fn ef_stub_xmss(&mut self) {
         self.xmss_stubbed = true;
+        self.leanvm_verifier = LeanVmVerifier::Fixed(true);
     }
 
     pub fn ef_tick(&mut self, since_genesis_ms: u64) {
@@ -1364,7 +1345,8 @@ impl BeaconStateTile {
     }
 
     pub fn ef_apply_attester_slashing(&mut self, ssz: &[u8]) {
-        // PQ gossip slashings wait on leanVM, so the spec handler runs here.
+        // PQ runs spec `on_attester_slashing`, without the gossip handler's
+        // seen and slashable checks.
         if !self.state.read_view(self.last_applied).is_pq() {
             if self.handle_attester_slashing(ssz) == Feedback::Accept {
                 self.recompute_head(|_| {});
@@ -1589,7 +1571,6 @@ impl Tile<SilverSpine> for BeaconStateTile {
         } else {
             self.syncing_loop(adapter)
         }
-
         if self.fork_choice.take_head_moved() {
             self.announce_head_change(&mut adapter.producers);
         }

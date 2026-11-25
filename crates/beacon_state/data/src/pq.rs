@@ -132,9 +132,9 @@ pub fn is_valid_vrf_proof(proof: &VRFProof, slot: Slot, vrf_root: &B256) -> bool
     // let mut node = vrf_leaf(vrf_secret(proof), slot);
     let mut node = *vrf_secret(proof);
     let mut pair = [0; 64];
-    for (height, sibling) in proof[32..].chunks_exact(32).enumerate() {
+    for (height, sibling) in proof[32..].as_chunks().0.iter().enumerate() {
         let (left, right) =
-            if (slot >> height) & 1 == 1 { (sibling, &node[..]) } else { (&node[..], sibling) };
+            if (slot >> height) & 1 == 1 { (sibling, &node) } else { (&node, sibling) };
         pair[..32].copy_from_slice(left);
         pair[32..].copy_from_slice(right);
         node = keccak256(&pair);

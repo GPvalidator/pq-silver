@@ -1,106 +1,75 @@
-use flux::{Timer, spine::SpineProducers};
-use silver_common::{LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheReader, TProducer};
+use flux_profiler::timed;
+use lean_vm::{AggregateClaims, AggregateProof, lean_xmss::LeanXmssPublicKey};
+use silver_beacon_state_data::{ValidatorsView, pq::xmss_pubkey};
 
-use crate::tile::{
-    Producers,
-    pq_aggregation::{
-        Claim,
-        wire::{VerifyRequest, decode_verify_response},
-    },
+use crate::{
+    stf::StarkClaims,
+    tile::pq_aggregation::{Claim, claim},
 };
 
-/// Set in every verify request's id, so its response is told apart from an
-/// aggregation's, whose ids count up from 0.
-const VERIFY_ID_BIT: u64 = 1 << 63;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProofVerdict {
-    Valid,
-    Invalid,
-    /// The leanVM sidecar did not judge the proof: it was down, the request
-    /// or its response did not fit or lapped in a tcache, or it refused the
-    /// request.
-    Unanswered,
-}
-
-/// Verify requests to the leanVM sidecar. Each is answered once, through
-/// [`Self::verdict`], under the id [`Self::send`] returned; the caller keeps
-/// what waits on it.
-pub struct LeanVmVerifier {
-    sent: u64,
-    claims: Vec<Claim>,
-    /// Each request awaiting its answer, and when it went out.
-    in_flight: Vec<(u64, Nanos)>,
-    round_trip: Timer,
+/// Verifies leanVM proofs on the tile's thread, so a verify blocks the loop
+/// for its duration.
+pub enum LeanVmVerifier {
+    /// Holds the claims of the proof being verified, sorted.
+    LeanVm(Vec<Claim>),
+    /// Spec vectors and tests carry no real proofs.
+    #[cfg(any(test, feature = "ef_tests"))]
+    Fixed(bool),
 }
 
 impl Default for LeanVmVerifier {
     fn default() -> Self {
-        Self {
-            sent: 0,
-            claims: Vec::new(),
-            in_flight: Vec::new(),
-            round_trip: Timer::new("silver", "leanvm_verify"),
-        }
+        Self::LeanVm(Vec::new())
     }
 }
 
 impl LeanVmVerifier {
-    /// Asks whether `proof` proves exactly the set of `claims`. `None` when
-    /// the tcache has no room for the request.
-    pub fn send(
+    /// How many proofs `stark` collected from `data`, or `None` at the first
+    /// invalid one.
+    pub fn stark_proofs_valid(
         &mut self,
-        claims: impl IntoIterator<Item = Claim>,
-        proof: &[u8],
-        tcache: &mut TProducer,
-        producers: &mut Producers,
-    ) -> Option<u64> {
-        self.claims.clear();
-        self.claims.extend(claims);
-        self.claims.sort_unstable();
-        self.claims.dedup();
-        debug_assert!(!self.claims.is_empty(), "leanVM has nothing to check against");
-        let request = VerifyRequest { claims: &self.claims, proof };
-        let Some(body) = tcache.write_with(request.len(), |out| request.write(out)) else {
-            silver_log::error!(len = request.len(), "beacon_state tcache full; verify not sent");
-            return None;
-        };
-        let request_id = self.next_request_id();
-        self.sent += 1;
-        self.in_flight.push((request_id, Nanos::now()));
-        producers.produce(LeanVmReq { request_id, body });
-        Some(request_id)
-    }
-
-    /// Ids go out in order, so the requests sent between two calls form a
-    /// range.
-    pub fn next_request_id(&self) -> u64 {
-        VERIFY_ID_BIT | self.sent
-    }
-
-    /// The verdict `resp` carries, if it answers a verify request.
-    pub fn verdict(
-        &mut self,
-        resp: &LeanVmResp,
-        reader: &mut TCacheReader,
-    ) -> Option<ProofVerdict> {
-        if resp.request_id & VERIFY_ID_BIT == 0 {
-            return None;
-        }
-        if let Some(at) = self.in_flight.iter().position(|&(id, _)| id == resp.request_id) {
-            let (_, sent) = self.in_flight.swap_remove(at);
-            if resp.body.is_some() {
-                self.round_trip.emit_latency_from_nanos(sent, Nanos::now());
+        stark: &StarkClaims,
+        data: &[u8],
+        validators: &ValidatorsView,
+    ) -> Option<usize> {
+        let mut proofs = 0;
+        for (signed, proof) in stark.proofs(data) {
+            let claims = signed.map(|(signer, message)| {
+                claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
+            });
+            if !self.verify(claims, proof) {
+                return None;
             }
+            proofs += 1;
         }
-        let Some(body) = resp.body else { return Some(ProofVerdict::Unanswered) };
-        let acquired = reader.acquire(body);
-        let verdict = acquired.buffer().ok().map(|(body, _)| decode_verify_response(body));
-        // A lapping writer could tear the bytes into a different verdict.
-        let Some(verdict) = verdict.filter(|_| acquired.revalidate().is_ok()) else {
-            silver_log::error!(request_id = resp.request_id, "leanvm verify response unreadable");
-            return Some(ProofVerdict::Unanswered);
+        Some(proofs)
+    }
+
+    /// Whether `proof` proves exactly the set of `claims`.
+    #[timed]
+    pub fn verify(&mut self, claims: impl IntoIterator<Item = Claim>, proof: &[u8]) -> bool {
+        let sorted = match self {
+            Self::LeanVm(sorted) => sorted,
+            #[cfg(any(test, feature = "ef_tests"))]
+            Self::Fixed(valid) => return *valid,
         };
-        Some(verdict)
+        sorted.clear();
+        sorted.extend(claims);
+        sorted.sort_unstable();
+        sorted.dedup();
+        debug_assert!(!sorted.is_empty(), "leanVM has nothing to check against");
+        // A key's bytes order as the key does, so the claims stay sorted.
+        let lean_xmss = sorted.iter().map(|claim| {
+            let (pubkey, message) = claim.split_first_chunk::<32>().expect("64-byte claim");
+            (LeanXmssPublicKey::from_bytes(pubkey), message.try_into().expect("64-byte claim"))
+        });
+        let claims = AggregateClaims {
+            lean_xmss: lean_xmss.collect(),
+            lean_sphincs: vec![],
+            da_commitment: None,
+        };
+        let valid = AggregateProof::from_bytes(proof).is_some_and(|proof| proof.verify(&claims));
+        silver_log::debug!(valid, "leanvm proof verdict");
+        valid
     }
 }

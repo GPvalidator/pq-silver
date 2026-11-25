@@ -89,7 +89,7 @@ impl Replacement {
                 Phase::SyncingDirectory(expected)
                     if file == directory && operation_id == expected =>
                 {
-                    return Ok(true)
+                    return Ok(true);
                 }
                 _ => return Err(io::Error::other("unexpected checkpoint sync completion")),
             },

@@ -1,7 +1,4 @@
-use std::{
-    fmt::{self, Display},
-    ops::Range,
-};
+use std::fmt::{self, Display};
 
 use flux::spine::SpineProducers;
 use silver_beacon_state_data::{
@@ -44,11 +41,9 @@ use super::{
     attestation_pool::{InsertOutcome, Participants},
     block::lookahead_proposer,
     fork_data_roots::ForkDataRoots,
-    gossip_proofs::{AggregateAwaitingProof, AwaitingProofs, GossipAwaitingProof},
     held_blocks::BlockSourceMsg,
-    leanvm_verifier::ProofVerdict,
     pending_envelopes::{BLOCK_WAIT_SLOTS, ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
-    pq_aggregation::{Aggregate, VerifiedVote, claim},
+    pq_aggregation::{Aggregate, Claim, VerifiedVote, claim},
     seen_aggregates::Coverage,
     seen_proposer_preferences::ProposerPreferences,
     shuffling_cache::ShufflingRequest,
@@ -322,6 +317,14 @@ pub(super) enum EnvelopeCheck {
 pub(super) struct BatchedVote {
     pub vote: NewGossipMsg,
     pub pin: TRead,
+}
+
+struct PqAggregateVotes {
+    target: stf::VoteTarget,
+    attesters: Vec<u32>,
+    committee_index: u64,
+    data_root: B256,
+    aggregator_index: usize,
 }
 
 impl BeaconStateTile {
@@ -2417,11 +2420,11 @@ impl BeaconStateTile {
         pin: &TRead,
         data: &[u8],
         producers: &mut Producers,
-    ) -> Option<Feedback> {
+    ) -> Feedback {
         if let Err(feedback) = self.precheck_pq_gossip(m.topic, data) {
-            return Some(feedback);
+            return feedback;
         }
-        let feedback = match m.topic {
+        match m.topic {
             GossipTopic::ProposerPreferences => self.handle_proposer_preferences(
                 data,
                 ForkName::Pq,
@@ -2439,30 +2442,10 @@ impl BeaconStateTile {
                 BlockSource::Gossip,
                 producers,
             ),
-            GossipTopic::BeaconAggregateAndProof => {
-                let (request_id, aggregate) = match self.send_pq_aggregate_proof(data, producers) {
-                    Ok(sent) => sent,
-                    Err(feedback) => return Some(feedback),
-                };
-                self.arrival_timers.aggregate(aggregate.target.attestation_slot, &self.ticker);
-                let gossip = GossipAwaitingProof::Aggregate(aggregate);
-                let slot = self.ticker.current_slot();
-                self.gossip_proofs.park(*m, pin.clone(), gossip, slot, request_id..request_id + 1);
-                return None;
-            }
-            GossipTopic::AttesterSlashing => {
-                let requests = match self.send_pq_attester_slashing_proofs(data, producers) {
-                    Ok(requests) => requests,
-                    Err(feedback) => return Some(feedback),
-                };
-                let gossip = GossipAwaitingProof::AttesterSlashing;
-                let slot = self.ticker.current_slot();
-                self.gossip_proofs.park(*m, pin.clone(), gossip, slot, requests);
-                return None;
-            }
+            GossipTopic::BeaconAggregateAndProof => self.handle_pq_aggregate(data),
+            GossipTopic::AttesterSlashing => self.handle_pq_attester_slashing(data),
             _ => Feedback::Ignore,
-        };
-        Some(feedback)
+        }
     }
 
     fn aggregate_state(&mut self, slot: Slot) -> StateId {
@@ -2501,19 +2484,22 @@ impl BeaconStateTile {
         data.source_epoch() == justified.epoch && *data.source_root() == justified.root
     }
 
-    fn send_pq_aggregate_proof(
-        &mut self,
-        signed: &[u8],
-        producers: &mut Producers,
-    ) -> Result<(u64, AggregateAwaitingProof), Feedback> {
-        let (state_id, mut aggregate) = self.check_pq_aggregate(signed)?;
-        self.verify_pq_aggregator(signed, state_id, &aggregate)?;
+    fn handle_pq_aggregate(&mut self, signed: &[u8]) -> Feedback {
+        let (state_id, votes, coverage) = match self.check_pq_aggregate(signed) {
+            Ok(checked) => checked,
+            Err(feedback) => return feedback,
+        };
+        if let Err(feedback) = self.verify_pq_aggregator(signed, state_id, &votes) {
+            return feedback;
+        }
+        self.arrival_timers.aggregate(votes.target.attestation_slot, &self.ticker);
+
         // The rolling proof serves any later local proposal. Without it only
         // the first block to include the aggregate uses it.
         let merges = if self.pq_aggregator.is_rolling() {
             self.has_local_proposers()
         } else {
-            let block_slot = aggregate.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+            let block_slot = votes.target.attestation_slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ;
             self.proposes_locally(block_slot)
         };
 
@@ -2524,23 +2510,20 @@ impl BeaconStateTile {
         let view = self.state.read_view(state_id);
         let domain = Self::attester_domain(&self.spec, &mut self.fork_data_roots, &view, data);
         let (_, message) = self.attestation_root_memo.roots(data.as_bytes(), &domain);
-        let claims = aggregate.attesters.iter().map(|&attester| {
+        let claims = votes.attesters.iter().map(|&attester| {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
         let merge_claims = merges.then(|| claims.clone().collect());
-        let proof = SignedAggregateAndProofPqView::proof(signed);
-        let request_id = self
-            .leanvm_verifier
-            .send(claims, proof, &mut self.events_producer, producers)
-            .ok_or(Feedback::Ignore)?;
-        aggregate.merge_claims = merge_claims;
-        Ok((request_id, aggregate))
+        if !self.leanvm_verifier.verify(claims, SignedAggregateAndProofPqView::proof(signed)) {
+            return Feedback::reject("STARK proof invalid");
+        }
+        self.commit_pq_aggregate(signed, votes, coverage, merge_claims)
     }
 
     fn check_pq_aggregate(
         &mut self,
         signed: &[u8],
-    ) -> Result<(StateId, AggregateAwaitingProof), Feedback> {
+    ) -> Result<(StateId, PqAggregateVotes, Coverage), Feedback> {
         let data = SignedAggregateAndProofPqView::agg_data(signed);
         let slot = data.slot();
         let target_epoch = data.target_epoch();
@@ -2560,7 +2543,7 @@ impl BeaconStateTile {
         let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
         let data_root = self.attestation_root_memo.data_root(data.as_bytes());
         let aggregator_index = SignedAggregateAndProofPqView::aggregator_index(signed) as usize;
-        self.unseen_aggregate_coverage(
+        let coverage = self.unseen_aggregate_coverage(
             slot,
             target_epoch,
             committee_index as u64,
@@ -2568,11 +2551,6 @@ impl BeaconStateTile {
             data_root,
             bits,
         )?;
-        if self.gossip_proofs.is_full() ||
-            self.gossip_proofs.awaits_aggregator(target_epoch, aggregator_index)
-        {
-            return Err(Feedback::Ignore);
-        }
 
         let state_id = self.aggregate_state(slot);
         let view = self.state.read_view(state_id);
@@ -2606,7 +2584,7 @@ impl BeaconStateTile {
             return Err(Feedback::reject("aggregate has no attesters"));
         }
 
-        Ok((state_id, AggregateAwaitingProof {
+        let votes = PqAggregateVotes {
             target: stf::VoteTarget {
                 block_root: *data.beacon_block_root(),
                 target_epoch,
@@ -2617,15 +2595,15 @@ impl BeaconStateTile {
             committee_index: committee_index as u64,
             data_root,
             aggregator_index,
-            merge_claims: None,
-        }))
+        };
+        Ok((state_id, votes, coverage))
     }
 
     fn verify_pq_aggregator(
         &mut self,
         signed: &[u8],
         state_id: StateId,
-        aggregate: &AggregateAwaitingProof,
+        aggregate: &PqAggregateVotes,
     ) -> Result<(), Feedback> {
         let target = aggregate.target;
         let view = self.state.read_view(state_id);
@@ -2654,81 +2632,39 @@ impl BeaconStateTile {
         Ok(())
     }
 
-    fn send_pq_attester_slashing_proofs(
-        &mut self,
-        slashing: &[u8],
-        producers: &mut Producers,
-    ) -> Result<Range<u64>, Feedback> {
-        if self.gossip_proofs.is_full() {
-            return Err(Feedback::Ignore);
-        }
-        let state_id = self.canonical_state_id();
-        let view = self.state.read_view(state_id);
+    fn handle_pq_attester_slashing(&mut self, slashing: &[u8]) -> Feedback {
+        let view = self.state.read_view(self.canonical_state_id());
         if !view.is_pq() {
-            return Err(Feedback::Ignore);
+            return Feedback::Ignore;
         }
         let seen = |vi| self.seen_attester_slashed.contains(vi);
         let claims = &mut self.stf_scratch.stark;
         match stf::validate_pq_attester_slashing_for_gossip(&view, slashing, seen, claims) {
             Ok(true) => {}
-            Ok(false) => return Err(Feedback::Ignore),
+            Ok(false) => return Feedback::Ignore,
             Err(e) => {
                 silver_log::debug!(error = %e, "attester_slashing gossip rejected");
-                return Err(Feedback::reject("attester slashing invalid"));
+                return Feedback::reject("attester slashing invalid");
             }
         }
-        self.send_stark_proofs(slashing, state_id, producers).ok_or(Feedback::Ignore)
-    }
-
-    pub(super) fn settle_gossip_proofs(
-        &mut self,
-        awaiting: AwaitingProofs,
-        verdict: ProofVerdict,
-        producers: &mut Producers,
-    ) {
-        let AwaitingProofs { msg, pin, gossip, .. } = awaiting;
-        let Some(data) = pin.buffer().ok().map(|(data, _)| data) else {
-            return Self::local_verdict(&msg, Feedback::Ignore, producers);
-        };
-        let feedback = match (verdict, gossip) {
-            (ProofVerdict::Unanswered, _) => Feedback::Ignore,
-            (ProofVerdict::Invalid, _) => Feedback::reject("STARK proof invalid"),
-            (ProofVerdict::Valid, GossipAwaitingProof::Aggregate(aggregate)) => {
-                self.commit_pq_aggregate(data, aggregate)
-            }
-            (ProofVerdict::Valid, GossipAwaitingProof::AttesterSlashing) => {
-                self.commit_pq_attester_slashing(data)
-            }
-        };
-        match feedback {
-            Feedback::Accept => {
-                Self::relay_gossip(&msg, None, producers);
-                self.publish_status(producers);
-            }
-            Feedback::Reject { reason, .. } => self.reject_gossip(&msg, data, reason, producers),
-            feedback => Self::local_verdict(&msg, feedback, producers),
+        let verifier = &mut self.leanvm_verifier;
+        match verifier.stark_proofs_valid(&self.stf_scratch.stark, slashing, &view.validators) {
+            Some(0) => Feedback::reject("attester slashing without a proof"),
+            Some(_) => self.commit_pq_attester_slashing(slashing),
+            None => Feedback::reject("STARK proof invalid"),
         }
     }
 
     fn commit_pq_aggregate(
         &mut self,
         signed: &[u8],
-        aggregate: AggregateAwaitingProof,
+        aggregate: PqAggregateVotes,
+        coverage: Coverage,
+        merge_claims: Option<Vec<Claim>>,
     ) -> Feedback {
         let target = aggregate.target;
         let (slot, committee_index) = (target.attestation_slot, aggregate.committee_index);
         let bits = SignedAggregateAndProofPqView::agg_aggregation_bits(signed);
-        let coverage = match self.unseen_aggregate_coverage(
-            slot,
-            target.target_epoch,
-            committee_index,
-            aggregate.aggregator_index,
-            aggregate.data_root,
-            bits,
-        ) {
-            Ok(coverage) => coverage,
-            Err(feedback) => return feedback,
-        };
         self.seen_aggregates.record(slot, committee_index, aggregate.data_root, bits);
         self.seen_aggregators.mark(target.target_epoch, aggregate.aggregator_index);
 
@@ -2740,7 +2676,7 @@ impl BeaconStateTile {
                 self.ticker.current_slot(),
             );
         }
-        if let Some(claims) = aggregate.merge_claims {
+        if let Some(claims) = merge_claims {
             let proof = SignedAggregateAndProofPqView::proof(signed).to_vec();
             let attestation = SignedAggregateAndProofPqView::aggregate(signed);
             match Aggregate::new(attestation, &aggregate.attesters, claims, proof) {
@@ -2821,10 +2757,7 @@ impl BeaconStateTile {
 
         let feedback = match m.topic {
             _ if m.domain.format() == ForkName::Pq && m.topic != GossipTopic::BeaconBlock => {
-                match self.handle_pq_gossip(&m, &acquired, data, producers) {
-                    Some(feedback) => feedback,
-                    None => return true,
-                }
+                self.handle_pq_gossip(&m, &acquired, data, producers)
             }
             GossipTopic::BeaconBlock if self.sync_target.is_syncing() => {
                 match self.parse_and_verify_block(data, pre_verified) {
@@ -2918,14 +2851,14 @@ impl BeaconStateTile {
                 Self::local_verdict(&m, feedback, producers)
             }
             Feedback::BlockKnown(_) => Self::local_verdict(&m, feedback, producers),
-            Feedback::BlockImported(_) | Feedback::AwaitData(_) | Feedback::AwaitVerify(_) => {}
+            Feedback::BlockImported(_) | Feedback::AwaitData(_) => {}
         }
         true
     }
 
     /// A local block the parse did not relay, held by a `consensus` level or
     /// staged before it arrived, is relayed once its transition has passed; a
-    /// block waiting on its columns or its STARK verdict has passed it.
+    /// block waiting on its columns has passed it.
     pub(super) fn relay_once_applied(
         &self,
         m: &NewGossipMsg,
@@ -2933,9 +2866,7 @@ impl BeaconStateTile {
         feedback: Feedback,
         producers: &mut Producers,
     ) {
-        let (Feedback::BlockImported(block_root) |
-        Feedback::AwaitData(block_root) |
-        Feedback::AwaitVerify(block_root)) = feedback
+        let (Feedback::BlockImported(block_root) | Feedback::AwaitData(block_root)) = feedback
         else {
             return;
         };

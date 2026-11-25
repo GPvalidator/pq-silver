@@ -62,7 +62,8 @@ pub(crate) fn post_prepare_beacon_proposer(
     resp.submit(
         records.len() * PreparationRecord::SIZE,
         |out| {
-            for (chunk, record) in out.chunks_exact_mut(PreparationRecord::SIZE).zip(&records) {
+            let chunks = out.as_chunks_mut::<{ PreparationRecord::SIZE }>().0;
+            for (chunk, record) in chunks.iter_mut().zip(&records) {
                 record.encode(chunk);
             }
         },

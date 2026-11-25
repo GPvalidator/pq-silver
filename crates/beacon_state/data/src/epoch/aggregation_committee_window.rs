@@ -148,7 +148,7 @@ impl AggregationCommitteeWindow {
             .nth(window_slot)?
             .ok()?;
         let members = elements(slot_ssz, None).ok()?.nth(index)?.ok()?;
-        Some(members.chunks_exact(8).map(|member| u64::from_le_bytes(member.try_into().unwrap())))
+        Some(members.as_chunks().0.iter().copied().map(u64::from_le_bytes))
     }
 
     /// Drops the oldest epoch and appends the next, whose slots each hold
@@ -206,7 +206,7 @@ impl AggregationCommitteeWindow {
         let committees = element(&self.ssz, slot, AGGREGATION_COMMITTEE_WINDOW_LEN);
         let count = if committees.is_empty() { 0 } else { u32_le(committees, 0) as usize / 4 };
         let committee = if index < count { element(committees, index, count) } else { &[] };
-        committee.chunks_exact(8).map(|member| u64::from_le_bytes(member.try_into().unwrap()))
+        committee.as_chunks().0.iter().copied().map(u64::from_le_bytes)
     }
 
     pub(crate) fn ssz_len(&self) -> usize {

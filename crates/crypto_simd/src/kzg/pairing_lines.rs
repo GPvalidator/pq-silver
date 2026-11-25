@@ -3,6 +3,10 @@
 use crate::bls::miller_lines::MillerLines;
 
 /// The `MillerLines` of `G2_S_POW_CELL`, then `G2_NEG_GENERATOR`.
+#[expect(
+    clippy::large_const_arrays,
+    reason = "the Lean proofs bind this `const`'s Aeneas extraction; a `static` would change it"
+)]
 pub const PAIRING_LINES: MillerLines = MillerLines([
     [
         [0x026ac873e30fc, 0x271fdb5e57634, 0x5ca5b3ccac955, 0xaad83e1c65855, 0x46246c59a8b17, 0x6718fa63b6934, 0x8023f75f10b27, 0x0000000002b91],

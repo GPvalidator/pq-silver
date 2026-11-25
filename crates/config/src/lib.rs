@@ -137,10 +137,59 @@ impl Default for MetricsConfig {
     }
 }
 
+/// The core each tile's thread is pinned to, and the logger's. Cores may
+/// repeat: an idle tile parks, so tiles can share a core. The leanVM prover
+/// takes physical cores after the highest of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TileCores {
+    pub control: usize,
+    pub network: usize,
+    pub beacon_state: usize,
+    pub storage: usize,
+    pub application_boundary: usize,
+    pub data_columns: usize,
+    pub log: usize,
+}
+
+impl Default for TileCores {
+    fn default() -> Self {
+        Self {
+            control: 1,
+            network: 2,
+            beacon_state: 3,
+            storage: 4,
+            application_boundary: 5,
+            data_columns: 6,
+            log: silver_log::DEFAULT_LOG_CORE,
+        }
+    }
+}
+
+impl TileCores {
+    pub fn highest(&self) -> usize {
+        let Self {
+            control,
+            network,
+            beacon_state,
+            storage,
+            application_boundary,
+            data_columns,
+            log,
+        } = *self;
+        [control, network, beacon_state, storage, application_boundary, data_columns, log]
+            .into_iter()
+            .max()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub tile_cores: TileCores,
     #[serde(default)]
     network: Network,
     #[serde(default)]
@@ -234,12 +283,13 @@ pub struct Config {
     suggested_fee_recipient: Option<[u8; 20]>,
     #[serde(default)]
     pbs: Option<PbsConfig>,
-    /// Unix socket of the leanVM sidecar.
+    /// How many cores the leanVM prover uses: the first physical cores after
+    /// `tile_cores`. Unset: all of them. 0: no prover.
     #[serde(default)]
-    leanvm_socket: Option<String>,
+    leanvm_cores: Option<usize>,
     /// Keeps one STARK proof of the pooled PQ votes not yet on chain, so a
     /// local proposal also includes votes older than the newest slot. Costs
-    /// about two more leanVM sidecar proofs each slot.
+    /// about two more leanVM proofs each slot.
     #[serde(default = "default_bool::<true>")]
     pq_rolling_aggregate: bool,
 }
@@ -262,8 +312,8 @@ impl Config {
                 None => self.pbs = Some(PbsConfig::new(endpoint)),
             }
         }
-        if let Some(socket) = overrides.leanvm_socket {
-            self.leanvm_socket = Some(socket);
+        if let Some(count) = overrides.leanvm_cores {
+            self.leanvm_cores = Some(count);
         }
     }
 }
@@ -276,7 +326,7 @@ pub struct Overrides {
     pub jwt_secret: Option<String>,
     pub unsafe_no_el: bool,
     pub pbs_endpoint: Option<String>,
-    pub leanvm_socket: Option<String>,
+    pub leanvm_cores: Option<usize>,
 }
 
 impl Config {
@@ -361,8 +411,9 @@ impl Config {
         self.pbs.as_ref()
     }
 
-    pub fn leanvm_socket(&self) -> Option<&str> {
-        self.leanvm_socket.as_deref()
+    /// `None` when unset, for all of them.
+    pub fn leanvm_cores(&self) -> Option<usize> {
+        self.leanvm_cores
     }
 
     pub fn pq_rolling_aggregate(&self) -> bool {
@@ -629,13 +680,29 @@ mod tests {
     }
 
     #[test]
-    fn leanvm_socket_comes_from_the_file_or_the_flag() {
-        assert!(Config::from_toml("", Overrides::default()).unwrap().leanvm_socket().is_none());
-        let toml = "leanvm_socket = \"/run/a.sock\"";
+    fn tile_cores_default_to_one_core_each_and_may_share_one() {
+        let cfg = Config::from_toml("", Overrides::default()).unwrap();
+        assert_eq!(cfg.tile_cores, TileCores::default());
+        assert_eq!(cfg.tile_cores.highest(), silver_log::DEFAULT_LOG_CORE);
+        let toml = "[tile_cores]\ncontrol = 0\nnetwork = 0\nbeacon_state = 0\nstorage = 0\n\
+                    application_boundary = 0\ndata_columns = 0\nlog = 0";
+        let one = Config::from_toml(toml, Overrides::default()).unwrap();
+        assert_eq!(one.tile_cores.highest(), 0);
+        let partial = Config::from_toml("[tile_cores]\nlog = 9", Overrides::default()).unwrap();
+        assert_eq!(partial.tile_cores, TileCores { log: 9, ..TileCores::default() });
+        assert!(Config::from_toml("[tile_cores]\nleanvm = 1", Overrides::default()).is_err());
+    }
+
+    #[test]
+    fn leanvm_cores_come_from_the_file_or_the_flag() {
+        assert!(Config::from_toml("", Overrides::default()).unwrap().leanvm_cores().is_none());
+        let none = Config::from_toml("leanvm_cores = 0", Overrides::default()).unwrap();
+        assert_eq!(none.leanvm_cores(), Some(0));
+        let toml = "leanvm_cores = 4";
         let cfg = Config::from_toml(toml, Overrides::default()).unwrap();
-        assert_eq!(cfg.leanvm_socket(), Some("/run/a.sock"));
-        let flag = Overrides { leanvm_socket: Some("/run/b.sock".into()), ..Overrides::default() };
-        assert_eq!(Config::from_toml(toml, flag).unwrap().leanvm_socket(), Some("/run/b.sock"));
+        assert_eq!(cfg.leanvm_cores(), Some(4));
+        let flag = Overrides { leanvm_cores: Some(2), ..Overrides::default() };
+        assert_eq!(Config::from_toml(toml, flag).unwrap().leanvm_cores(), Some(2));
     }
 
     #[test]

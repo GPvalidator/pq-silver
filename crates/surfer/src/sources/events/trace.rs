@@ -389,10 +389,10 @@ pub mod tests {
         assert_eq!(unheld.stf.wait_span(), None);
     }
 
-    /// A PQ block's attestation proof goes to leanVM after apply; the verdict
-    /// imports or rejects it.
+    /// A PQ block's proofs verify between its transition and its import; an
+    /// invalid proof rejects it.
     #[test]
-    fn pq_block_waits_on_leanvm() {
+    fn pq_block_verifies_between_transition_and_import() {
         let pq = |end| {
             gloas_trace(&[
                 (received(), 420),
@@ -415,7 +415,7 @@ pub mod tests {
         assert_eq!(rejected.interval(Span::Strip), iv(at(2, 420), at(2, 861)), "ends at rejection");
     }
 
-    /// Nothing went to leanVM: the verify row is the import instant.
+    /// Nothing to verify: the verify row is the import instant.
     #[test]
     fn pq_block_without_a_proof_is_verified_at_import() {
         for gate in [StfGate::NoAttestations, StfGate::OwnBlock] {

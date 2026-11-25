@@ -471,8 +471,8 @@ pub fn process_block_body(
         // Pass 1 is read-only: hand it the read-only sibling over the same fork.
         if input.fork == BlockFork::Pq {
             verify_xmss_signatures_pq(&fork.read(), offsets, input)?;
-            // STARK proofs are verified after the block applies, so the claims
-            // are collected while applying it.
+            // STARK proofs are verified once the transition passes, so the
+            // claims are collected while applying it.
             stark.begin(offsets.serialized().expect("a PQ body is parsed whole"));
             stark_claims = Some(stark);
         } else {

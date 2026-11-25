@@ -31,9 +31,7 @@ impl PayloadExecutionRequests {
         layout: RequestsLayout,
     ) -> impl Iterator<Item = &[u8; BUILDER_EXIT_REQUEST_SIZE]> {
         let [_, _, _, _, builder_exits, ..] = layout.sections(self.get(block_root, layout));
-        builder_exits
-            .chunks_exact(BUILDER_EXIT_REQUEST_SIZE)
-            .map(|request| request.try_into().expect("BUILDER_EXIT_REQUEST_SIZE bytes"))
+        builder_exits.as_chunks::<BUILDER_EXIT_REQUEST_SIZE>().0.iter()
     }
 
     pub fn drop_outdated(&mut self, is_live: impl Fn(&B256) -> bool) {

@@ -8,11 +8,11 @@ use crate::{
 
 #[timed]
 pub fn hash_builder_bid_fulu(bid: &[u8]) -> B256 {
+    let commitments =
+        BuilderBidFuluView::blob_kzg_commitments(bid).as_chunks::<BYTES_PER_KZG_COMMITMENT>().0;
     let commitments = hash_list(
         MerkleStack::new(MAX_BLOB_COMMITMENTS_PER_BLOCK),
-        BuilderBidFuluView::blob_kzg_commitments(bid)
-            .chunks_exact(BYTES_PER_KZG_COMMITMENT)
-            .map(hash_fixed_bytes),
+        commitments.iter().map(|commitment| hash_fixed_bytes(commitment)),
     );
     merkleize(&[
         hash_execution_payload_header_fulu(BuilderBidFuluView::header(bid)),

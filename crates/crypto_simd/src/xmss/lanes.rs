@@ -13,8 +13,8 @@ pub(crate) const RATE_WORDS: usize = 136 / 8;
 /// XORs `bytes`, a multiple of 8 long, into lane `l` from word `at`.
 pub(crate) fn absorb(lanes: &mut Lanes, l: usize, at: usize, bytes: &[u8]) {
     debug_assert!(bytes.len().is_multiple_of(8) && at + bytes.len() / 8 <= RATE_WORDS);
-    for (word, chunk) in lanes[at..].iter_mut().zip(bytes.chunks_exact(8)) {
-        word[l] ^= u64::from_le_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in lanes[at..].iter_mut().zip(bytes.as_chunks().0) {
+        word[l] ^= u64::from_le_bytes(*chunk);
     }
 }
 

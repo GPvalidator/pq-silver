@@ -250,7 +250,6 @@ impl BeaconStateTile {
             }),
             Feedback::BlockImported(_) |
             Feedback::AwaitData(_) |
-            Feedback::AwaitVerify(_) |
             Feedback::BlockKnown(_) |
             Feedback::Ignore |
             Feedback::AlreadySeen |

@@ -44,8 +44,6 @@ pub enum PrecheckError {
     BlockKnown { block_root: B256 },
     #[error("block awaiting data availability: block_root=0x{}", b256_hex(block_root))]
     AwaitingData { block_root: B256 },
-    #[error("block awaiting its STARK verdict: block_root=0x{}", b256_hex(block_root))]
-    AwaitingVerify { block_root: B256 },
     #[error("block already rejected: block_root=0x{} reason={reason:?}", b256_hex(block_root))]
     Rejected { block_root: B256, reason: RejectReason },
     #[error("block ticker slot precheck failed: block_slot={block_slot} wall_slot={wall_slot}")]
@@ -120,7 +118,6 @@ impl PrecheckError {
             Self::ParentRejected { reason: RejectReason::InvalidPayload, .. } => Feedback::Ignore,
             Self::PastSlot { .. } => Feedback::reject("block slot not after parent"),
             Self::BlockKnown { block_root } => Feedback::BlockKnown(block_root),
-            Self::AwaitingVerify { block_root } => Feedback::AwaitVerify(block_root),
             Self::UnverifiedParentPayload { parent_root, block_root } => {
                 Feedback::AwaitParentPayload { parent_root, block_root }
             }
@@ -164,6 +161,8 @@ pub enum Error {
     InvalidBlockSig,
     #[error("BLS sig batch verification failed")]
     SigBatchFailed,
+    #[error("STARK proof invalid")]
+    StarkProofInvalid,
 
     #[error("invalid attestation: {0}")]
     InvalidAttestation(#[from] AttestationError),

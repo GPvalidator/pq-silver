@@ -56,9 +56,7 @@ impl<'a> BuilderBid<'a> {
 
     pub fn accepts(&self, builder_pubkey: &BLSPubkey) -> bool {
         self.builder_pubkeys.is_empty() ||
-            self.builder_pubkeys
-                .chunks_exact(size_of::<BLSPubkey>())
-                .any(|key| key == builder_pubkey)
+            self.builder_pubkeys.as_chunks().0.contains(builder_pubkey)
     }
 
     fn parse(frame: &'a [u8]) -> Option<(Self, &'a [u8])> {

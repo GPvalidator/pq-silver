@@ -3,10 +3,8 @@ use silver_common::ssz_view::{
 };
 
 use super::{claims::Claim, strategy::MAX_GROUPS};
-use crate::tile::leanvm_verifier::ProofVerdict;
 
 const OP_AGGREGATE: u8 = 1;
-const OP_VERIFY: u8 = 2;
 const SIGNED_CLAIM_SIZE: usize = 64 + XMSS_SIGNATURE_SIZE;
 
 /// Most leanXMSS signatures in one request.
@@ -79,54 +77,6 @@ impl AggregateRequest<'_> {
     }
 }
 
-/// One `verify` request: does `proof` prove exactly `claims`?
-pub(in crate::tile) struct VerifyRequest<'a> {
-    /// Strictly sorted, as the proof's own are.
-    pub claims: &'a [Claim],
-    pub proof: &'a [u8],
-}
-
-impl VerifyRequest<'_> {
-    pub(in crate::tile) fn len(&self) -> usize {
-        1 + proof_len(self.claims.len(), self.proof.len())
-    }
-
-    /// Fills `out`, which must be exactly `len()` bytes.
-    pub(in crate::tile) fn write(&self, mut out: &mut [u8]) {
-        put(&mut out, &[OP_VERIFY]);
-        put_claims(&mut out, self.claims);
-        put_bytes(&mut out, self.proof);
-        assert!(out.is_empty(), "verify request shorter than its slice");
-    }
-
-    #[cfg(test)]
-    pub(super) fn body(&self) -> Vec<u8> {
-        let mut body = vec![0; self.len()];
-        self.write(&mut body);
-        body
-    }
-}
-
-/// Decodes a `verify` response: status 0, then 1 for a proof that proves its
-/// claims, else 0. Anything else leaves the proof unjudged.
-pub(in crate::tile) fn decode_verify_response(body: &[u8]) -> ProofVerdict {
-    match body {
-        [0, 1] => ProofVerdict::Valid,
-        [0, 0] => ProofVerdict::Invalid,
-        [status, rest @ ..] => {
-            let mut rest = rest;
-            let message = take_bytes(&mut rest).unwrap_or_default();
-            let message = String::from_utf8_lossy(message);
-            silver_log::error!(status, %message, "leanvm verify response is not a verdict");
-            ProofVerdict::Unanswered
-        }
-        [] => {
-            silver_log::error!("leanvm sidecar sent an empty verify response");
-            ProofVerdict::Unanswered
-        }
-    }
-}
-
 /// Panics if `out` is shorter than `bytes`.
 fn put(out: &mut &mut [u8], bytes: &[u8]) {
     let (head, tail) = std::mem::take(out).split_at_mut(bytes.len());
@@ -188,14 +138,14 @@ pub(in crate::tile) struct AggregateResponse<'a> {
 }
 
 impl<'a> AggregateResponse<'a> {
-    /// A non-zero status logs the leanVM sidecar's message and fails.
+    /// A non-zero status logs the prover's message and fails.
     pub(super) fn decode(body: &'a [u8]) -> Result<Self, &'static str> {
         let (&status, mut rest) = body.split_first().ok_or("empty response")?;
         if status != 0 {
             let message = take_bytes(&mut rest).unwrap_or_default();
             let message = String::from_utf8_lossy(message);
-            silver_log::warn!(status, %message, "leanvm sidecar rejected the batch");
-            return Err("rejected by the leanvm sidecar");
+            silver_log::warn!(status, %message, "leanvm prover rejected the batch");
+            return Err("rejected by the leanvm prover");
         }
         Self::parse(rest).ok_or("malformed response")
     }
@@ -209,14 +159,13 @@ impl<'a> AggregateResponse<'a> {
     fn parse_claims(mut bytes: &[u8]) -> Option<Vec<Claim>> {
         let count = take_u64(&mut bytes).filter(|&count| count <= MAX_PROOF_CLAIMS)?;
         let claim_bytes = take(&mut bytes, count.checked_mul(64)?)?;
-        let claims: Vec<Claim> =
-            claim_bytes.chunks_exact(64).map(|c| c.try_into().unwrap()).collect();
+        let claims: Vec<Claim> = claim_bytes.as_chunks().0.to_vec();
         let sorted = claims.windows(2).all(|pair| pair[0] < pair[1]);
         let no_sphincs_and_no_da = take_u64(&mut bytes)? == 0 && take(&mut bytes, 1)? == [0];
         (sorted && no_sphincs_and_no_da && bytes.is_empty()).then_some(claims)
     }
 
-    /// A successful response body, as the leanVM sidecar writes it.
+    /// A successful response body, as the prover writes it.
     #[cfg(test)]
     pub(in crate::tile) fn encode(claims: &[Claim], proof: &[u8]) -> Vec<u8> {
         let mut body = vec![0; 1 + proof_len(claims.len(), proof.len())];

@@ -189,9 +189,9 @@ impl IndexedAttestation<'_> {
         self.data.encode(data.try_into().expect("ATTESTATION_DATA_SIZE bytes"));
         ssz[4 + ATTESTATION_DATA_SIZE..INDEXED_ATTESTATION_PQ_FIXED]
             .copy_from_slice(&(proof_at as u32).to_le_bytes());
-        let indices = ssz[INDEXED_ATTESTATION_PQ_FIXED..proof_at].chunks_exact_mut(8);
-        for (chunk, index) in indices.zip(&self.attesting_indices) {
-            chunk.copy_from_slice(&index.to_le_bytes());
+        let indices = ssz[INDEXED_ATTESTATION_PQ_FIXED..proof_at].as_chunks_mut().0;
+        for (chunk, index) in indices.iter_mut().zip(&self.attesting_indices) {
+            *chunk = index.to_le_bytes();
         }
         self.proof.decode_into(&mut ssz[proof_at..]);
     }

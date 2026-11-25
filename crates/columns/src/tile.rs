@@ -423,7 +423,7 @@ impl DataColumnsTile {
             &mut self.tracker,
             producers,
         ) else {
-            return
+            return;
         };
         let Some(cells) = &mut self.cells else { return };
         if cells.store().context(&root).is_some() {

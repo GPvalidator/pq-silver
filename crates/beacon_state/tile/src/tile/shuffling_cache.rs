@@ -53,10 +53,8 @@ impl ShufflingEntry {
         };
         let len = size_of_val(self.shuffled_indices.as_slice());
         let Some(indices) = producer.write_with(len, |buffer| {
-            for (bytes, index) in
-                buffer.chunks_exact_mut(size_of::<u32>()).zip(&self.shuffled_indices)
-            {
-                bytes.copy_from_slice(&index.to_le_bytes());
+            for (bytes, index) in buffer.as_chunks_mut().0.iter_mut().zip(&self.shuffled_indices) {
+                *bytes = index.to_le_bytes();
             }
         }) else {
             silver_log::warn!(

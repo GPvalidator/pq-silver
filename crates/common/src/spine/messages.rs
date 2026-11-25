@@ -208,7 +208,7 @@ impl ProposerPreparation {
     }
 
     pub fn decode_all(bytes: &[u8]) -> impl Iterator<Item = Self> {
-        bytes.chunks_exact(Self::SIZE).map(|record| Self {
+        bytes.as_chunks::<{ Self::SIZE }>().0.iter().map(|record| Self {
             validator_index: u64::from_le_bytes(record[..8].try_into().expect("8 bytes")),
             fee_recipient: record[8..Self::SIZE].try_into().expect("20 bytes"),
         })
@@ -254,7 +254,7 @@ impl SlotSubnets {
         let word = |record: &[u8], at: usize| {
             u64::from_le_bytes(record[at..at + 8].try_into().expect("8 bytes"))
         };
-        bytes.chunks_exact(Self::SIZE).map(move |record| Self {
+        bytes.as_chunks::<{ Self::SIZE }>().0.iter().map(move |record| Self {
             slot: word(record, 0),
             attesting: word(record, 8),
             aggregating: word(record, 16),
@@ -1503,8 +1503,6 @@ pub enum BlockStage {
     AwaitParent,
     /// State transition committed.
     AwaitData,
-    /// State transition committed; leanVM has yet to verify its STARK proofs.
-    AwaitVerify,
     Applied,
     AlreadyKnown,
 }
@@ -1514,11 +1512,13 @@ pub enum BlockStage {
 pub struct StfStamp {
     /// Wall clock when CL validation passed and the transition began.
     pub validated_at: Nanos,
+    /// Wall clock when the state transition passed.
+    pub applied_at: Nanos,
     pub gate: StfGate,
 }
 
-/// What a block waited on between its transition and fork choice; a PQ block
-/// imported at once says why leanVM had nothing to verify.
+/// What a block waited on between its transition and fork choice. A PQ block
+/// verifies its proofs there, or says why it had none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
 #[repr(u8)]
 pub enum StfGate {
@@ -1819,7 +1819,7 @@ pub struct EngineHealthEvent {
     pub sync_status: ELSyncStatus,
 }
 
-/// A leanVM sidecar request body, op byte onwards and unframed.
+/// A leanVM tile request body, op byte onwards and unframed.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
 pub struct LeanVmReq {
@@ -1827,7 +1827,7 @@ pub struct LeanVmReq {
     pub body: TCacheRead,
 }
 
-/// A leanVM sidecar response body, status byte included. `None` is no answer.
+/// A leanVM tile response body, status byte included. `None` is no answer.
 #[derive(Clone, Copy, Debug, TypeHash)]
 #[repr(C)]
 pub struct LeanVmResp {

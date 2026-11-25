@@ -779,8 +779,11 @@ impl Store {
                     let end = start.saturating_add(count);
                     let columns: Vec<u64> =
                         DataColumnSidecarsByRangeRequestView::columns(&ssz[..len])
-                            .chunks_exact(8)
-                            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                            .as_chunks()
+                            .0
+                            .iter()
+                            .copied()
+                            .map(u64::from_le_bytes)
                             .collect();
 
                     silver_log::info!(?stream_id, start, count, "storage query");
@@ -812,8 +815,11 @@ impl Store {
                             let id = DataColumnsByRootRequestView::identifier(buf, i);
                             let root = DataColumnsByRootIdentifierView::block_root(id);
                             let request_columns = DataColumnsByRootIdentifierView::columns(id)
-                                .chunks_exact(8)
-                                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()));
+                                .as_chunks()
+                                .0
+                                .iter()
+                                .copied()
+                                .map(u64::from_le_bytes);
 
                             // Serve a specific block's columns regardless of
                             // canonicity: unfinalized (by block_root) first,

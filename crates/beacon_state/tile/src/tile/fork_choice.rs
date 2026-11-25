@@ -335,10 +335,7 @@ impl BeaconStateTile {
             return;
         };
 
-        for pa in section.chunks_exact(PAYLOAD_ATTESTATION_SIZE) {
-            let Ok(pa) = <&[u8; PAYLOAD_ATTESTATION_SIZE]>::try_from(pa) else {
-                continue;
-            };
+        for pa in section.as_chunks::<PAYLOAD_ATTESTATION_SIZE>().0 {
             let data = PayloadAttestation::data(pa);
             let block_root = *PayloadAttestationData::beacon_block_root(data);
             let present = PayloadAttestationData::payload_present(data);

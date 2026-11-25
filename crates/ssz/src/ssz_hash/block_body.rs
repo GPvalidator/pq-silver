@@ -12,7 +12,7 @@ use crate::{
         hash_variable_list, merkleize, uint64_chunk,
     },
     ssz_view::{
-        BeaconBlockBodyGloasView, BeaconBlockBodyPqView, DepositView,
+        BYTES_PER_KZG_COMMITMENT, BeaconBlockBodyGloasView, BeaconBlockBodyPqView, DepositView,
         ExecutionPayloadHeaderFuluView, ProposerSlashingView, SYNC_COMMITTEE_BITS_SIZE,
         SignedBlsToExecutionChangeView, SignedVoluntaryExitView,
     },
@@ -210,9 +210,11 @@ fn field_roots(body_offsets: &BodyOffsets<'_>) -> BodyFieldRoots {
         MerkleStack::new(16),
         or_empty(body_offsets.bls_changes()),
     );
+    let commitments =
+        body_offsets.blob_commitments_fulu().as_chunks::<BYTES_PER_KZG_COMMITMENT>().0;
     let blob_commitments = hash_list(
         MerkleStack::new(4096),
-        body_offsets.blob_commitments_fulu().chunks_exact(48).map(hash_fixed_bytes),
+        commitments.iter().map(|commitment| hash_fixed_bytes(commitment)),
     );
     let execution_requests = hash_execution_requests_fulu(body_offsets.execution_requests());
 

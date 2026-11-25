@@ -278,8 +278,8 @@ impl SigBatch {
         // Patch any all-zero chunk: a zero scalar would null this tuple's
         // contribution to the pairing sum, so the tuple wouldn't actually be
         // checked. Probability is ~n·2⁻⁶⁴ but the scan is free.
-        for c in self.rand_bytes.chunks_exact_mut(RAND_BYTES) {
-            if c.iter().all(|&b| b == 0) {
+        for c in self.rand_bytes.as_chunks_mut::<RAND_BYTES>().0 {
+            if *c == [0; RAND_BYTES] {
                 c[0] = 1;
             }
         }

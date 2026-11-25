@@ -37,6 +37,7 @@ use silver_control::{Controller, sync_engine::SyncEngine};
 use silver_discovery::{DiscV5, Discovery};
 use silver_gossip::GossipHandler;
 use silver_httpcore::Bind;
+use silver_leanvm::LeanVmTile;
 use silver_network::{ClusterNodes, Context, InboundLimits, NetworkTile, P2p};
 use silver_peer::PeerManager;
 use silver_storage::tile::StorageTile;
@@ -66,6 +67,9 @@ const CONTROL_RPC_TCACHE_SIZE: usize = 1 << 20;
 /// two-million-validator set, so the two the validator API serves never wait
 /// on the one being written.
 const BEACON_STATE_TCACHE_SIZE: usize = 1 << 25;
+/// leanVM responses: a proof is at most 1 MiB, and `beacon_state` copies
+/// each out as it arrives.
+const LEANVM_TCACHE_SIZE: usize = 1 << 24;
 /// Every column of a full block is about 6 MiB.
 const PROPOSED_COLUMNS_TCACHE_SIZE: usize = 1 << 24;
 const _: () = assert!(
@@ -96,13 +100,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Before tracing, which pins the logger to a configured core.
+    let config = args.config()?;
+    let cores = config.tile_cores;
+    silver_log::set_log_core(cores.log);
+
     let build_info_log = format!("silver build info: {BUILD_INFO}");
     let _tracing = initialise_tracing_log_on_core(
         "silver",
         10,
         None,
         false,
-        Some(silver_log::LOG_CORE),
+        Some(cores.log),
         Some(&build_info_log),
     );
     if let Err(e) = silver_log::counts::enable(APP_NAME) {
@@ -113,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // `#[timed]` is inert until a process opts in.
     enable_profiler(APP_NAME);
 
-    let config = args.config()?;
+    silver_log::info!("loaded config: {config:#?}");
     #[cfg(not(feature = "metrics"))]
     if config.metrics.enabled {
         return Err("metrics.enabled requires building silver with --features metrics".into());
@@ -170,6 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         TCache::producer(TCacheId::BeaconStateHandoff, BEACON_STATE_TCACHE_SIZE);
     let proposed_columns_producer =
         TCache::producer(TCacheId::ProposedColumns, PROPOSED_COLUMNS_TCACHE_SIZE);
+    let leanvm_producer = TCache::producer(TCacheId::LeanVmProcessing, LEANVM_TCACHE_SIZE);
 
     // Tiles.
     let keypair = Keypair::load_or_create(Path::new(&chain_config.data_dir))?;
@@ -288,6 +298,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         beacon_state_handoff_producer.cache_ref(),
         control_slot_producer.cache_ref(),
         proposed_columns_producer.cache_ref(),
+        leanvm_producer.cache_ref(),
     ]);
 
     let p2p_context = Context {
@@ -404,7 +415,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         &spec,
         beacon_state_tile.reader(),
         config.engine_config(),
-        config.leanvm_socket(),
         config.pbs(),
         config.builder_bid_timeout(),
         tcaches,
@@ -421,16 +431,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         tile
     };
 
+    let mut leanvm_cores = silver_leanvm::physical_cores(cores.highest() + 1);
+    if let Some(count) = config.leanvm_cores() {
+        if count > leanvm_cores.len() {
+            let free = leanvm_cores.len();
+            silver_log::warn!(count, free, "leanvm_cores asks for more cores than are free");
+        }
+        leanvm_cores.truncate(count);
+    }
+    if leanvm_cores.is_empty() {
+        silver_log::warn!("no leanVM prover: no free cores, or leanvm_cores = 0");
+    } else {
+        silver_log::info!(?leanvm_cores, "leanVM prover cores");
+    }
+    // Without a prover the tile only answers each request `None`, unpinned.
+    let leanvm_tile_config = match leanvm_cores.first() {
+        Some(&core) => TileConfig::new(core, Some(ThreadNiceness::Highest)),
+        None => TileConfig::background(None, Some(flux::timing::Duration::from_millis(1))),
+    };
+    let leanvm_tile = LeanVmTile::new(leanvm_cores, tcaches, leanvm_producer);
+
     // Spine
     let spine = SilverSpine::new(None);
     spine.start(None, None, |scoped_spine| {
         let tiles = [
-            attached(control_tile, scoped_spine, 1),
-            attached(network_tile, scoped_spine, 2),
-            attached(beacon_state_tile, scoped_spine, 3),
-            attached(storage_tile, scoped_spine, 4),
-            attached(application_boundary_tile, scoped_spine, 5),
-            attached(data_columns_tile, scoped_spine, 6),
+            attached(control_tile, scoped_spine, cores.control),
+            attached(network_tile, scoped_spine, cores.network),
+            attached(beacon_state_tile, scoped_spine, cores.beacon_state),
+            attached(storage_tile, scoped_spine, cores.storage),
+            attached(application_boundary_tile, scoped_spine, cores.application_boundary),
+            attached(data_columns_tile, scoped_spine, cores.data_columns),
+            (
+                leanvm_tile.name(),
+                Box::new(tile_runner(leanvm_tile, scoped_spine, leanvm_tile_config)),
+            ),
         ];
         for (name, run) in tiles {
             thread::Builder::new()

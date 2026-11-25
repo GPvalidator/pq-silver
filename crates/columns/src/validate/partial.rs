@@ -123,7 +123,7 @@ impl ColumnValidator {
         let Some((state, parent_slot, expected_domain)) =
             self.beacon_state.read(|view| self.state_validate(parent, slot, &header, view))
         else {
-            return HeaderOutcome::Ignore
+            return HeaderOutcome::Ignore;
         };
 
         if slot <= state.finalized_slot() || state.proposer == ProposerCheck::Unresolvable {

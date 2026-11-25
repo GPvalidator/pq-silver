@@ -4,7 +4,10 @@
 
 use std::{
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
+    },
 };
 
 use flux::utils::{ThreadNiceness, thread_boot};
@@ -32,12 +35,24 @@ pub static LOG_SITES: [LogSite];
 
 static COUNTERS: AtomicPtr<AtomicU64> = AtomicPtr::new(ptr::null_mut());
 
-pub const LOG_CORE: usize = 7;
+/// The logger's core unless the process sets another.
+pub const DEFAULT_LOG_CORE: usize = 7;
+
+static LOG_CORE: OnceLock<usize> = OnceLock::new();
+
+/// Sets the logger's core, once, before any thread boots on it.
+pub fn set_log_core(core: usize) {
+    LOG_CORE.set(core).expect("the log core is set once");
+}
+
+pub fn log_core() -> usize {
+    LOG_CORE.get().copied().unwrap_or(DEFAULT_LOG_CORE)
+}
 
 /// Background threads share the logging core, so they stay off the tiles'
 /// cores.
 pub fn boot_on_log_core() {
-    thread_boot(&[LOG_CORE], Some(ThreadNiceness::Medium));
+    thread_boot(&[log_core()], Some(ThreadNiceness::Medium));
 }
 
 /// Counter `i` counts `LOG_SITES[i]`. Events before this are not counted.
@@ -104,7 +119,7 @@ macro_rules! warn {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{LOG_CORE, LOG_SITES, LogSite, attach, boot_on_log_core};
+    use super::{LOG_SITES, LogSite, attach, boot_on_log_core, log_core};
 
     macro_rules! forwarded {
         ($message:expr) => {
@@ -154,7 +169,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn background_threads_move_onto_the_log_core() {
-        if std::thread::available_parallelism().unwrap().get() <= LOG_CORE {
+        if std::thread::available_parallelism().unwrap().get() <= log_core() {
             return;
         }
         let allowed = std::thread::spawn(|| {
@@ -163,6 +178,6 @@ mod tests {
             let line = status.lines().find(|line| line.starts_with("Cpus_allowed_list:"));
             line.unwrap().split_whitespace().nth(1).unwrap().to_owned()
         });
-        assert_eq!(allowed.join().unwrap(), LOG_CORE.to_string());
+        assert_eq!(allowed.join().unwrap(), log_core().to_string());
     }
 }

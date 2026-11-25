@@ -43,7 +43,6 @@ use super::{
     block::{ParsedBlock, StagedBlock},
     block_production::Proposal,
     held_blocks::{BlockSourceMsg, ORPHAN_TIMEOUT_SLOTS},
-    leanvm_verifier::ProofVerdict,
     pending_envelopes::{ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
     shuffling_cache::ShufflingRequest,
     *,
@@ -139,12 +138,14 @@ fn make_tile_at_wall_slot_ws(wall_slot: u64, verify_weak_subjectivity: bool) -> 
     let engine_p = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
     let delivery_p = TCache::producer(TCacheId::StorageDelivery, 1 << 20);
     let columns_p = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+    let leanvm_p = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
     let mut tile = BeaconStateTile::new(
         ticker,
         Arc::new(SpecConfig::mainnet()),
         &SyncingConfig::default(),
         TCacheTable::from_iter(
-            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p].map(|p| p.cache_ref()),
+            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p, &leanvm_p]
+                .map(|p| p.cache_ref()),
         ),
         TCache::producer(TCacheId::BeaconStateHandoff, 1 << 20),
         verify_weak_subjectivity,
@@ -182,12 +183,14 @@ fn make_tile_with_producers(
     let engine_p = TCache::producer(TCacheId::BoundaryProcessing, 1 << 20);
     let delivery_p = TCache::producer(TCacheId::StorageDelivery, 1 << 20);
     let columns_p = TCache::producer(TCacheId::ControlSlot, 1 << 16);
+    let leanvm_p = TCache::producer(TCacheId::LeanVmProcessing, 1 << 16);
     let mut tile = BeaconStateTile::new(
         ticker,
         Arc::new(spec),
         &SyncingConfig::default(),
         TCacheTable::from_iter(
-            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p].map(|p| p.cache_ref()),
+            [&gossip_p, &event_p, &engine_p, &delivery_p, &columns_p, &leanvm_p]
+                .map(|p| p.cache_ref()),
         ),
         TCache::producer(TCacheId::BeaconStateHandoff, 1 << 20),
         true,
@@ -5204,12 +5207,6 @@ impl ThreeForks {
         Self::on(make_tile())
     }
 
-    /// The producer writes block bytes the tile can read back.
-    fn with_gossip() -> (Self, TProducer) {
-        let (tile, gossip, _rpc) = make_tile_with_gossip(1, BeaconState::empty_test(0));
-        (Self::on(tile), gossip)
-    }
-
     fn on(mut tile: BeaconStateTile) -> Self {
         seed_tile(&mut tile, 4, 0);
         let anchor_id = tile.last_applied;
@@ -5250,36 +5247,6 @@ impl ThreeForks {
         parent: StateId,
         slot: Slot,
     ) -> StateId {
-        let (block, id) = self.applied_block(producer, root, parent_root, parent, slot);
-        self.tile.held.stage(block);
-        id
-    }
-
-    /// A block parked on its STARK verdict: STF committed to `id`, not in
-    /// fork choice.
-    /// Parks under verify request ids `slot * 10 ..`, one per proof.
-    fn park_for_verify(
-        &mut self,
-        producer: &mut TProducer,
-        root: B256,
-        parent_root: B256,
-        parent: StateId,
-        slot: Slot,
-        proofs: u64,
-    ) -> StateId {
-        let (block, id) = self.applied_block(producer, root, parent_root, parent, slot);
-        self.tile.held.park_for_verify(block, slot * 10..slot * 10 + proofs);
-        id
-    }
-
-    fn applied_block(
-        &mut self,
-        producer: &mut TProducer,
-        root: B256,
-        parent_root: B256,
-        parent: StateId,
-        slot: Slot,
-    ) -> (StagedBlock, StateId) {
         let id = self.roll(parent, slot, root);
         let BlockSourceMsg::Gossip(_, ssz) = gossip_pending(&mut self.tile, producer, slot) else {
             unreachable!()
@@ -5300,7 +5267,8 @@ impl ThreeForks {
             parent_payload_status: PayloadStatus::Full,
             relay_eligible: false,
         };
-        (StagedBlock::with_state_id(parsed, id, ssz, BlockSource::Gossip), id)
+        self.tile.held.stage(StagedBlock::with_state_id(parsed, id, ssz, BlockSource::Gossip));
+        id
     }
 }
 
@@ -5457,88 +5425,6 @@ fn el_valid_is_kept_on_a_staged_block() {
     assert!(staged.el_valid);
 }
 
-/// Each proof is its own request, so the block imports on the last `Valid`.
-#[test]
-fn stark_valid_imports_parked_block_once_every_proof_verifies() {
-    const S_ROOT: B256 = [0x05; 32];
-    let (mut forks, mut producer) = ThreeForks::with_gossip();
-    let (_spine, mut adapter) = spine_adapter(&forks.tile);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 2);
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none(), "out until verified");
-
-    forks.tile.handle_stark_verdict(31, ProofVerdict::Valid, &mut adapter.producers);
-    assert!(forks.tile.held.is_awaiting_verify(&S_ROOT), "one proof still out");
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Valid, &mut adapter.producers);
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_some(), "imported");
-}
-
-/// An invalid proof fails the block's transition: it never enters fork
-/// choice, and a re-delivered copy is not run again.
-#[test]
-fn stark_invalid_rejects_parked_block() {
-    const S_ROOT: B256 = [0x05; 32];
-    let mut forks = ThreeForks::new();
-    let (mut spine, mut adapter) = spine_adapter(&forks.tile);
-    let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
-    sink.consume(|_: BeaconStateEvent, _| {});
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 2);
-
-    forks.tile.handle_stark_verdict(31, ProofVerdict::Invalid, &mut adapter.producers);
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Valid, &mut adapter.producers);
-
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-    assert_eq!(forks.tile.held.rejected_reason(&S_ROOT), Some(RejectReason::FailedTransition));
-    let mut rejected = Vec::new();
-    sink.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::BlockRejected { block_root, .. } = event {
-            rejected.push(block_root);
-        }
-    });
-    assert_eq!(rejected, [S_ROOT], "the peer that served it is told");
-}
-
-/// A proof leanVM never judged says nothing about the block, so a
-/// re-delivered copy runs again.
-#[test]
-fn stark_unanswered_drops_parked_block_without_rejecting_it() {
-    const S_ROOT: B256 = [0x05; 32];
-    let mut forks = ThreeForks::new();
-    let (_spine, mut adapter) = spine_adapter(&forks.tile);
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
-
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Unanswered, &mut adapter.producers);
-
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-    assert_eq!(forks.tile.held.rejected_reason(&S_ROOT), None);
-}
-
-/// A block parked on its verdict holds a committed state, so finalization
-/// re-anchors it like a staged block.
-#[test]
-fn parked_blocks_follow_finalization() {
-    const S_ROOT: B256 = [0x05; 32];
-    const S2_ROOT: B256 = [0x52; 32];
-    let mut forks = ThreeForks::new();
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    let s_id = forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
-    forks.park_for_verify(&mut producer, S2_ROOT, F2_ROOT, forks.f2_id, 2, 1);
-
-    forks.tile.maybe_finalize();
-
-    let held = &mut forks.tile.held;
-    assert!(!held.is_awaiting_verify(&S2_ROOT), "S2 dropped with F2");
-    assert!(held.is_awaiting_verify(&S_ROOT), "S survives");
-    let s_rebased = *held.state_ids_mut().next().expect("S is the only held block");
-    assert_ne!(s_rebased, s_id, "stale bundle replaced");
-}
-
 /// Finality at or past a held block's slot leaves it beside the finalized
 /// block, even with its parent kept: it can no longer import.
 #[test]
@@ -5546,22 +5432,22 @@ fn held_blocks_at_or_below_the_finalized_slot_are_dropped() {
     const S_ROOT: B256 = [0x05; 32];
     let mut forks = ThreeForks::new();
     let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
+    forks.stage(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3);
 
     forks.tile.held.drop_outdated(2, |_| true);
-    assert!(forks.tile.held.is_awaiting_verify(&S_ROOT));
+    assert!(forks.tile.held.is_staged(&S_ROOT));
     forks.tile.held.drop_outdated(3, |_| true);
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
+    assert!(!forks.tile.held.is_staged(&S_ROOT));
 }
 
-/// A block parked on its verdict is not in fork choice, yet a second
-/// proposal for its slot still equivocates against it.
+/// A staged block is not in fork choice, yet a second proposal for its slot
+/// still equivocates against it.
 #[test]
-fn a_parked_block_counts_toward_equivocation() {
+fn a_staged_block_counts_toward_equivocation() {
     const S_ROOT: B256 = [0x05; 32];
     let mut forks = ThreeForks::new();
     let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
+    forks.stage(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3);
 
     assert!(forks.tile.equivocates(3, 0, &[0x06; 32]));
     assert!(!forks.tile.equivocates(3, 0, &S_ROOT), "not against itself");
@@ -5599,6 +5485,19 @@ fn el_invalid_staged_block_is_remembered_as_rejected() {
     assert_eq!(err.feedback(), Feedback::Ignore, "spec: parent valid, its payload invalid");
 }
 
+/// A rejected block can never import, so its orphans drop with it.
+#[test]
+fn a_rejected_block_drops_its_orphans() {
+    let (mut tile, mut gp, _rp, _spine, mut adapter) = tile_with_producers(200);
+    seed_tile(&mut tile, 4, 10);
+    buffer_orphan_idx(&mut tile, &mut gp, &mut adapter.producers, 1);
+    let (parent, child) = (root_with(1, 0x00), root_with(1, 0xFF));
+    assert!(tile.held.holds(&child));
+
+    tile.held.reject(parent, tile.head_state_slot(), RejectReason::FailedTransition);
+    assert!(!tile.held.holds(&child));
+}
+
 /// Spec `beacon_block` gossip: a parent that failed its state transition never
 /// reached the EL, so its child is a REJECT; only an EL-invalid payload on a
 /// consensus-valid parent is an IGNORE.
@@ -5606,7 +5505,7 @@ fn el_invalid_staged_block_is_remembered_as_rejected() {
 fn child_of_transition_failed_block_is_rejected() {
     const X_ROOT: B256 = [0x06; 32];
     let mut forks = ThreeForks::new();
-    forks.tile.held.reject(X_ROOT, 3);
+    forks.tile.held.reject(X_ROOT, 3, RejectReason::FailedTransition);
 
     let child = empty_block_at(4, X_ROOT);
     let Err(err) = forks.tile.parse_and_verify_block(&child, false) else {
@@ -7756,47 +7655,47 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
 }
 
 mod leanvm_verifier {
-    use silver_common::{LeanVmReq, LeanVmResp};
+    use lean_vm::{OutputClaims, lean_xmss};
 
-    use super::*;
-    use crate::tile::leanvm_verifier::{LeanVmVerifier, ProofVerdict};
+    use crate::tile::leanvm_verifier::LeanVmVerifier;
 
-    /// A verify request goes out under an id whose response the verifier
-    /// claims, while an aggregation's id stays the aggregator's.
+    /// Claims in silver's form, `pubkey | message` in any order, judge a real
+    /// proof as leanVM's own claims do.
     #[test]
-    fn verify_request_is_answered_under_its_own_id() {
-        let spec = SpecConfig { pq_fork_epoch: 1, ..SpecConfig::mainnet() };
-        let (mut tile, mut gossip, _rpc, mut spine, mut adapter) =
-            tile_with_producers_on(40, BeaconState::empty_test(0), spec);
-        let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
-        sink.consume(|_: LeanVmReq, _| {});
+    #[ignore = "proves with the real prover"]
+    fn a_real_proof_verifies_against_its_claims_only() {
+        let message = [7; lean_xmss::MESSAGE_LEN];
+        let signed: Vec<_> = (0..3u8)
+            .map(|k| {
+                let (secret_key, public_key) = lean_xmss::key_gen(&[k; lean_xmss::SECRET_KEY_LEN]);
+                secret_key.prepare(7);
+                (public_key, message, lean_xmss::sign(&secret_key, &message, 7))
+            })
+            .collect();
+        let claims: Vec<[u8; 64]> = signed
+            .iter()
+            .rev()
+            .map(|(public_key, message, _)| {
+                let mut claim = [0; 64];
+                claim[..32].copy_from_slice(&public_key.to_bytes());
+                claim[32..].copy_from_slice(message);
+                claim
+            })
+            .collect();
+        lean_vm::setup(2);
+        let (proven, proof) =
+            lean_vm::aggregate(&[], signed, vec![], None, OutputClaims::All, 2).unwrap();
+        assert_eq!(proven.lean_xmss.len(), 3);
+        let proof = proof.to_bytes();
 
         let mut verifier = LeanVmVerifier::default();
-        let claims = [[1; 64], [2; 64]];
-        let tcache = &mut tile.events_producer;
-        let first = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
-        let second = verifier.send(claims, b"proof", tcache, &mut adapter.producers).unwrap();
-        assert_ne!(first, second);
-        let mut requests = Vec::new();
-        sink.consume(|request: LeanVmReq, _| requests.push(request));
-        assert_eq!(requests.iter().map(|r| r.request_id).collect::<Vec<_>>(), [first, second]);
-        assert_eq!(tile.events_producer.read_buffer(requests[0].body).unwrap()[0], 2, "verify op");
-
-        let mut answer = |request_id, body: Option<&[u8]>| {
-            let body = body.map(|body| {
-                gossip.write_with(body.len(), |out| out.copy_from_slice(body)).unwrap()
-            });
-            verifier.verdict(&LeanVmResp { request_id, body }, &mut tile.reader)
-        };
-        assert_eq!(answer(first, Some(&[0, 1])), Some(ProofVerdict::Valid));
-        assert_eq!(answer(second, Some(&[0, 0])), Some(ProofVerdict::Invalid));
-        assert_eq!(answer(first, None), Some(ProofVerdict::Unanswered), "the sidecar went down");
-        assert_eq!(answer(0, Some(&[0, 1])), None, "an aggregation's response");
+        assert!(verifier.verify(claims.iter().copied(), &proof));
+        assert!(!verifier.verify(claims[1..].iter().copied(), &proof), "a claim short");
     }
 }
 
 mod pq_aggregator {
-    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
+    use silver_common::{LeanVmReq, LeanVmResp, TReservation};
     use silver_ssz::ssz_view::{AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
@@ -7830,15 +7729,14 @@ mod pq_aggregator {
             sink.consume(|_: BeaconApiResponse, _| {});
             tile.consume_shared(&mut adapter);
             // The block of `SLOT` came 1 s in, so merges of earlier slots run.
-            tile.pq_aggregator.on_block_settled(SLOT, &tile.ticker);
+            tile.pq_aggregator.on_block_imported(SLOT, &tile.ticker);
             Self { tile, gossip, adapter, sink, _spine: spine }
         }
 
-        /// What the transport publishes when the connection drops while a
-        /// request is out, taken in through the tile's own consume path.
-        fn disconnect(&mut self, request_id: u64) {
+        /// The prover's answer without a proof, taken in through the tile's
+        /// own consume path.
+        fn unanswered(&mut self, request_id: u64) {
             self.sink.produce(LeanVmResp { request_id, body: None });
-            self.sink.produce(LeanVmHealthEvent { ready: false });
             self.tile.consume_shared(&mut self.adapter);
             self.send_next();
         }
@@ -7851,7 +7749,7 @@ mod pq_aggregator {
         }
 
         fn ready(&mut self) {
-            self.tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+            self.tile.pq_aggregator.on_prover_ready();
             self.send_next();
         }
 
@@ -7901,10 +7799,10 @@ mod pq_aggregator {
             self.respond(request.request_id, &[[3; 64]]);
         }
 
-        /// The slot starts and its block is verified at once.
+        /// The slot starts and its block imports at once.
         fn start_slot(&mut self, slot: Slot) {
             self.start_slot_without_a_block(slot);
-            self.tile.pq_aggregator.on_block_settled(slot, &self.tile.ticker);
+            self.tile.pq_aggregator.on_block_imported(slot, &self.tile.ticker);
             self.send_next();
         }
 
@@ -7967,7 +7865,7 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_vote_sends_a_request_once_the_leanvm_sidecar_is_ready() {
+    fn a_vote_sends_a_request_once_the_prover_is_ready() {
         let mut rig = Rig::new();
         rig.vote_on(ROOT_A, 1);
         rig.vote_on(ROOT_B, 3);
@@ -8035,7 +7933,7 @@ mod pq_aggregator {
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64]]);
         rig.start_slot_without_a_block(SLOT + 1);
-        assert!(rig.requests().is_empty(), "the block may still need the leanVM sidecar");
+        assert!(rig.requests().is_empty(), "the block may not have imported yet");
 
         let deadline_ms = rig.tile.ticker.slot_start(SLOT + 1).as_millis_u64() + 12_000 / 4;
         rig.tile.ticker.set_since_genesis_ms(deadline_ms - 1);
@@ -8048,14 +7946,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_merge_starts_as_soon_as_the_next_slots_block_is_settled() {
+    fn a_merge_starts_as_soon_as_the_next_slots_block_imports() {
         let mut rig = Rig::new();
         rig.ready();
         rig.aggregate(SLOT, &[[1; 64]]);
         rig.start_slot_without_a_block(SLOT + 1);
         assert!(rig.requests().is_empty());
 
-        rig.tile.pq_aggregator.on_block_settled(SLOT + 1, &rig.tile.ticker);
+        rig.tile.pq_aggregator.on_block_imported(SLOT + 1, &rig.tile.ticker);
         rig.send_next();
         let request = rig.request();
         assert!(rig.carries(&request, 1));
@@ -8119,7 +8017,7 @@ mod pq_aggregator {
         rig.ready();
         rig.two_merged_slots();
         let roll = rig.request();
-        rig.disconnect(roll.request_id);
+        rig.unanswered(roll.request_id);
 
         let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
         assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])]);
@@ -8192,29 +8090,6 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_disconnect_costs_one_failure_and_nothing_is_sent_until_ready() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
-        let first = rig.request();
-        assert_eq!(rig.tags(&first), [1]);
-
-        rig.disconnect(first.request_id);
-        assert!(rig.requests().is_empty(), "no request goes to a leanvm sidecar that is down");
-
-        rig.ready();
-        let second = rig.request();
-        assert_eq!(rig.tags(&second), [1], "A ties with B and has the lower key");
-        rig.respond(first.request_id, &[[1; 64]]);
-        assert!(rig.requests().is_empty(), "a late answer to the lost request is ignored");
-
-        rig.respond(second.request_id, &[[1; 64]]);
-        let third = rig.request();
-        assert_eq!(rig.tags(&third), [3]);
-    }
-
-    #[test]
     fn a_full_tcache_retries_without_a_failure() {
         let mut rig = Rig::new();
         rig.ready();
@@ -8232,14 +8107,14 @@ mod pq_aggregator {
     }
 
     #[test]
-    fn a_pruned_request_keeps_the_leanvm_sidecar_busy_until_its_response() {
+    fn a_pruned_request_keeps_the_prover_busy_until_its_response() {
         let mut rig = Rig::new();
         rig.ready();
         rig.vote(1);
         let stale = rig.request();
         rig.tile.pq_aggregator.prune_before(SLOT + 1);
         rig.aggregate(SLOT - 1, &[[9; 64]]);
-        assert!(rig.requests().is_empty(), "the leanvm sidecar is still proving the old batch");
+        assert!(rig.requests().is_empty(), "the prover is still proving the old batch");
 
         rig.respond(stale.request_id, &[[1; 64]]);
         assert!(rig.served().is_none(), "the pruned leaf is gone");

@@ -1,0 +1,25 @@
+[package]
+name = "silver_leanvm"
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+flux.workspace = true
+flux-profiler.workspace = true
+lean_vm.workspace = true
+silver_common.workspace = true
+silver_log.workspace = true
+
+[dev-dependencies]
+silver_common = { workspace = true, features = ["test-util"] }
+
+[features]
+# The experimental prover once more per CPU tier, the fastest picked at run
+# time. Only a release build with leanVM's `scripts/tier-rustc` as
+# `RUSTC_WRAPPER` compiles the tiers for their CPUs; `just build-prod` does.
+cpu_tiers = ["lean_vm/cpu_tiers"]
+
+[lints]
+workspace = true
