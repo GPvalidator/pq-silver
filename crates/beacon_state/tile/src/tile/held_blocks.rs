@@ -194,9 +194,10 @@ impl HeldBlocks {
         self.rejected.get(block_root).map(|r| r.reason)
     }
 
-    pub(super) fn reject(&mut self, block_root: B256, slot: Slot) {
-        let reason = RejectReason::FailedTransition;
+    /// The block can never import, so neither can its orphans.
+    pub(super) fn reject(&mut self, block_root: B256, slot: Slot, reason: RejectReason) {
         self.rejected.insert(block_root, Rejected { slot, reason });
+        self.orphans.drop_children(&block_root);
     }
 
     pub(super) fn stage(&mut self, staged: StagedBlock) -> B256 {
@@ -244,9 +245,7 @@ impl HeldBlocks {
             PayloadValidationStatus::Invalid => {
                 let staged = staged.remove();
                 let slot = staged.parsed.header.slot;
-                let reason = RejectReason::InvalidPayload;
-                self.rejected.insert(*block_root, Rejected { slot, reason });
-                self.orphans.drop_children(block_root);
+                self.reject(*block_root, slot, RejectReason::InvalidPayload);
                 return StagedVerdict::Rejected(staged.source);
             }
             PayloadValidationStatus::Syncing | PayloadValidationStatus::Accepted => {}

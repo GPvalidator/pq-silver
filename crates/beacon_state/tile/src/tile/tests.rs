@@ -5485,6 +5485,19 @@ fn el_invalid_staged_block_is_remembered_as_rejected() {
     assert_eq!(err.feedback(), Feedback::Ignore, "spec: parent valid, its payload invalid");
 }
 
+/// A rejected block can never import, so its orphans drop with it.
+#[test]
+fn a_rejected_block_drops_its_orphans() {
+    let (mut tile, mut gp, _rp, _spine, mut adapter) = tile_with_producers(200);
+    seed_tile(&mut tile, 4, 10);
+    buffer_orphan_idx(&mut tile, &mut gp, &mut adapter.producers, 1);
+    let (parent, child) = (root_with(1, 0x00), root_with(1, 0xFF));
+    assert!(tile.held.holds(&child));
+
+    tile.held.reject(parent, tile.head_state_slot(), RejectReason::FailedTransition);
+    assert!(!tile.held.holds(&child));
+}
+
 /// Spec `beacon_block` gossip: a parent that failed its state transition never
 /// reached the EL, so its child is a REJECT; only an EL-invalid payload on a
 /// consensus-valid parent is an IGNORE.
@@ -5492,7 +5505,7 @@ fn el_invalid_staged_block_is_remembered_as_rejected() {
 fn child_of_transition_failed_block_is_rejected() {
     const X_ROOT: B256 = [0x06; 32];
     let mut forks = ThreeForks::new();
-    forks.tile.held.reject(X_ROOT, 3);
+    forks.tile.held.reject(X_ROOT, 3, RejectReason::FailedTransition);
 
     let child = empty_block_at(4, X_ROOT);
     let Err(err) = forks.tile.parse_and_verify_block(&child, false) else {

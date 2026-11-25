@@ -523,7 +523,8 @@ impl BeaconStateTile {
                     head_slot = self.head_state_slot(),
                     "block rejected"
                 );
-                self.held.reject(parsed.block_root, parsed.header.slot);
+                let reason = RejectReason::FailedTransition;
+                self.held.reject(parsed.block_root, parsed.header.slot, reason);
                 Err(Feedback::reject_block(parsed.block_root, "block failed transition"))
             }
         }
