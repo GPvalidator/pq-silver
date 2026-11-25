@@ -1345,7 +1345,8 @@ impl BeaconStateTile {
     }
 
     pub fn ef_apply_attester_slashing(&mut self, ssz: &[u8]) {
-        // PQ gossip slashings wait on leanVM, so the spec handler runs here.
+        // PQ runs spec `on_attester_slashing`, without the gossip handler's
+        // seen and slashable checks.
         if !self.state.read_view(self.last_applied).is_pq() {
             if self.handle_attester_slashing(ssz) == Feedback::Accept {
                 self.recompute_head(|_| {});

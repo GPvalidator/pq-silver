@@ -1517,8 +1517,8 @@ pub struct StfStamp {
     pub gate: StfGate,
 }
 
-/// What a block waited on between its transition and fork choice; a PQ block
-/// imported at once says why leanVM had nothing to verify.
+/// What a block waited on between its transition and fork choice. A PQ block
+/// verifies its proofs there, or says why it had none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TypeHash)]
 #[repr(u8)]
 pub enum StfGate {

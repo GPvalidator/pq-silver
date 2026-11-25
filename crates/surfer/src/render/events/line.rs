@@ -479,8 +479,8 @@ mod tests {
         assert!(line.spans.iter().any(|s| s.content == theme.symbols.separator));
     }
 
-    /// Like `no blobs`, a verify leanVM never ran is an instant that names
-    /// its reason; a rejected verify says so in the verdict colour.
+    /// Like `no blobs`, a verify that never ran is an instant that names its
+    /// reason; a rejected verify says so in the verdict colour.
     #[test]
     fn pq_verify_names_why_it_took_no_time() {
         let theme = Theme::default();
