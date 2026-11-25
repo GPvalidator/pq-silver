@@ -1188,9 +1188,7 @@ impl BeaconStateTile {
             self.handle_engine_response(eng_resp, producers);
         });
 
-        // Health first: a disconnect fails the batch in flight once, before
-        // its `None` answer arrives.
-        adapter.consume(|health: LeanVmHealthEvent, _| self.pq_aggregator.on_health(health));
+        adapter.consume(|_: LeanVmHealthEvent, _| self.pq_aggregator.on_prover_ready());
         adapter
             .consume(|resp: LeanVmResp, _| self.pq_aggregator.on_response(resp, &mut self.reader));
 

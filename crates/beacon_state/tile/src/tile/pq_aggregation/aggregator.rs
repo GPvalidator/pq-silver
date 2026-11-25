@@ -4,8 +4,7 @@ use flux::{Timer, spine::SpineProducers};
 use rustc_hash::FxHashMap;
 use silver_beacon_state_data::{B256, Slot, pq::MIN_ATTESTATION_INCLUSION_DELAY_PQ};
 use silver_common::{
-    LeanVmHealthEvent, LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader,
-    TProducer,
+    LeanVmReq, LeanVmResp, Nanos, TCacheProducer, TCacheRead, TCacheReader, TProducer,
     ssz_view::{MAX_VALIDATORS_PER_COMMITTEE, SingleAttestationPqView},
     ticker::SlotTicker,
 };
@@ -67,14 +66,6 @@ impl LeanVm {
     fn up(&mut self) {
         if let Self::Down = self {
             *self = Self::Idle;
-        }
-    }
-
-    /// The job that was in flight, now lost.
-    fn down(&mut self) -> Option<Job> {
-        match mem::take(self) {
-            Self::Busy { job, .. } => Some(job),
-            Self::Down | Self::Idle => None,
         }
     }
 
@@ -235,14 +226,8 @@ impl PqAggregator {
         self.changed = true;
     }
 
-    /// A leanVM sidecar that goes down fails the batch in flight at once. The
-    /// transport's `None` answer for it comes later and is ignored.
-    pub fn on_health(&mut self, health: LeanVmHealthEvent) {
-        if health.ready {
-            self.leanvm.up();
-        } else if let Some(job) = self.leanvm.down() {
-            self.finish(job, None);
-        }
+    pub fn on_prover_ready(&mut self) {
+        self.leanvm.up();
         self.changed = true;
     }
 

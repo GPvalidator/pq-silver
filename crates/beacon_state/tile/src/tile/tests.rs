@@ -7683,7 +7683,7 @@ mod leanvm_verifier {
 }
 
 mod pq_aggregator {
-    use silver_common::{LeanVmHealthEvent, LeanVmReq, LeanVmResp, TReservation};
+    use silver_common::{LeanVmReq, LeanVmResp, TReservation};
     use silver_ssz::ssz_view::{AttestationPqView, ProvedAttestationView, SINGLE_ATT_PQ_SIZE};
 
     use super::*;
@@ -7721,11 +7721,10 @@ mod pq_aggregator {
             Self { tile, gossip, adapter, sink, _spine: spine }
         }
 
-        /// What the transport publishes when the connection drops while a
-        /// request is out, taken in through the tile's own consume path.
-        fn disconnect(&mut self, request_id: u64) {
+        /// The prover's answer without a proof, taken in through the tile's
+        /// own consume path.
+        fn unanswered(&mut self, request_id: u64) {
             self.sink.produce(LeanVmResp { request_id, body: None });
-            self.sink.produce(LeanVmHealthEvent { ready: false });
             self.tile.consume_shared(&mut self.adapter);
             self.send_next();
         }
@@ -7738,7 +7737,7 @@ mod pq_aggregator {
         }
 
         fn ready(&mut self) {
-            self.tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+            self.tile.pq_aggregator.on_prover_ready();
             self.send_next();
         }
 
@@ -8006,7 +8005,7 @@ mod pq_aggregator {
         rig.ready();
         rig.two_merged_slots();
         let roll = rig.request();
-        rig.disconnect(roll.request_id);
+        rig.unanswered(roll.request_id);
 
         let (attestations, _) = rig.tile.pq_aggregator.block_proof(SLOT + 3).unwrap();
         assert_eq!(attestations, [attestation_in(SLOT + 1, 0, [0])]);
@@ -8076,29 +8075,6 @@ mod pq_aggregator {
         rig.aggregate(SLOT - 1, &[[10; 64]]);
         let request = rig.request();
         assert!(rig.carries(&request, 10), "an earlier arrival would go first");
-    }
-
-    #[test]
-    fn a_disconnect_costs_one_failure_and_nothing_is_sent_until_ready() {
-        let mut rig = Rig::new();
-        rig.ready();
-        rig.vote_on(ROOT_A, 1);
-        rig.vote_on(ROOT_B, 3);
-        let first = rig.request();
-        assert_eq!(rig.tags(&first), [1]);
-
-        rig.disconnect(first.request_id);
-        assert!(rig.requests().is_empty(), "no request goes to a leanvm sidecar that is down");
-
-        rig.ready();
-        let second = rig.request();
-        assert_eq!(rig.tags(&second), [1], "A ties with B and has the lower key");
-        rig.respond(first.request_id, &[[1; 64]]);
-        assert!(rig.requests().is_empty(), "a late answer to the lost request is ignored");
-
-        rig.respond(second.request_id, &[[1; 64]]);
-        let third = rig.request();
-        assert_eq!(rig.tags(&third), [3]);
     }
 
     #[test]

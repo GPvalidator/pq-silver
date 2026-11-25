@@ -6,7 +6,7 @@ use silver_beacon_state_data::{
     },
 };
 use silver_common::{
-    ForkName, GossipDomain, LeanVmHealthEvent, LeanVmReq, ProposerPreparation, SlotSubnets,
+    ForkName, GossipDomain, LeanVmReq, ProposerPreparation, SlotSubnets,
     compute_subnet_for_attestation,
     ssz_hash::hash_attestation_data,
     ssz_view::{
@@ -337,7 +337,7 @@ fn unknown_root_vote_counts_and_is_aggregated_once_its_block_imports() {
     }
     .encode(&mut subscription);
     tile.aggregator_subnets.record(&subscription);
-    tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+    tile.pq_aggregator.on_prover_ready();
 
     let msg = pq_gossip_msg(&tile, &mut gossip, &bytes, GossipTopic::BeaconAttestation(subnet));
     tile.on_gossip(msg, &mut adapter.producers);
@@ -488,7 +488,7 @@ fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
         adapter.consume(|_: LeanVmReq, _| {});
 
-        tile.pq_aggregator.on_health(LeanVmHealthEvent { ready: true });
+        tile.pq_aggregator.on_prover_ready();
         let tcache = &mut tile.events_producer;
         tile.pq_aggregator.send_next(&tile.ticker, tcache, &mut adapter.producers);
         let mut merges = 0;
