@@ -16,7 +16,7 @@
 mod tests;
 mod wire;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use flux::{spine::SpineAdapter, tile::Tile, utils::try_thread_boot};
 use flux_profiler::timed;
@@ -149,14 +149,17 @@ impl LeanVmTile {
 /// thread lies below `first` is left out: a tile or the logger already runs
 /// there. The prover gains nothing from a second thread on a core.
 pub fn physical_cores(first: usize) -> Vec<usize> {
-    let allowed = flux::core_affinity::get_core_ids().unwrap_or_default();
-    let mut cores: Vec<usize> = allowed
+    let mut allowed = flux::core_affinity::get_core_ids().unwrap_or_default();
+    allowed.sort_unstable_by_key(|core| core.id);
+    let mut seen = HashSet::new();
+    allowed
         .into_iter()
         .map(|core| core.id)
-        .filter(|&cpu| cpu >= first && first_sibling(cpu) == cpu)
-        .collect();
-    cores.sort_unstable();
-    cores
+        .filter(|&cpu| {
+            let sibling = first_sibling(cpu);
+            sibling >= first && seen.insert(sibling)
+        })
+        .collect()
 }
 
 /// The lowest CPU sharing `cpu`'s physical core, `cpu` itself when the

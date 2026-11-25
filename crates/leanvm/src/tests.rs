@@ -2,7 +2,10 @@
 //! leanVM's pool on the cores in `LEANVM_TEST_CORES` (e.g. `0,1,2,3`), pin
 //! the test thread to the first, and prove for a while.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use flux::{spine::SpineAdapter, tile::Tile};
 use lean_vm::{AggregateClaims, AggregateProof, lean_xmss};
@@ -106,9 +109,12 @@ fn without_a_prover_every_request_is_answered_none() {
 fn physical_cores_take_one_thread_per_core_from_first_on() {
     let all = super::physical_cores(0);
     assert!(!all.is_empty());
-    assert!(all.iter().all(|&cpu| super::first_sibling(cpu) == cpu));
+    let allowed = flux::core_affinity::get_core_ids().unwrap();
+    let physical: HashSet<_> = allowed.iter().map(|core| super::first_sibling(core.id)).collect();
+    assert_eq!(all.len(), physical.len());
     let from_two = super::physical_cores(2);
-    assert!(from_two.iter().all(|&cpu| cpu >= 2 && all.contains(&cpu)));
+    let expected: Vec<_> = all.into_iter().filter(|&cpu| super::first_sibling(cpu) >= 2).collect();
+    assert_eq!(from_two, expected);
 }
 
 fn test_cores() -> Vec<usize> {
