@@ -94,32 +94,33 @@ pub fn decode_aggregate(body: &[u8]) -> Result<Request<'_>, Refusal> {
         children.push((claims, proof));
     }
 
-    // `count` checked that every record follows, so the reads below succeed.
-    let n = c.count(XMSS_RECORD).ok_or_else(|| malformed("leanXMSS signatures"))?;
-    let raw_lean_xmss = (0..n)
-        .map(|_| {
-            let public_key = LeanXmssPublicKey::from_bytes(c.array().unwrap());
-            let message = *c.array().unwrap();
-            (public_key, message, LeanXmssSignature::from_bytes(c.array().unwrap()))
+    let raw_lean_xmss = c
+        .records(XMSS_RECORD, |c| {
+            let public_key = LeanXmssPublicKey::from_bytes(c.array()?);
+            let message = *c.array()?;
+            Some((public_key, message, LeanXmssSignature::from_bytes(c.array()?)))
         })
-        .collect();
-    let n = c.count(SPHINCS_RECORD).ok_or_else(|| malformed("leanSPHINCS signatures"))?;
-    let raw_lean_sphincs = (0..n)
-        .map(|_| {
-            let public_key = LeanSphincsPublicKey::from_bytes(c.array().unwrap());
-            let message = *c.array().unwrap();
-            (public_key, message, LeanSphincsSignature::from_bytes(c.array().unwrap()))
+        .ok_or_else(|| malformed("leanXMSS signatures"))?;
+    let raw_lean_sphincs = c
+        .records(SPHINCS_RECORD, |c| {
+            let public_key = LeanSphincsPublicKey::from_bytes(c.array()?);
+            let message = *c.array()?;
+            Some((public_key, message, LeanSphincsSignature::from_bytes(c.array()?)))
         })
-        .collect();
+        .ok_or_else(|| malformed("leanSPHINCS signatures"))?;
 
     let n = c.count(BLOB_BYTES).ok_or_else(|| malformed("blobs"))?;
     if n > lean_da::DA_MAX_ROWS {
         let message = format!("{n} blobs: expected 1 to {}", lean_da::DA_MAX_ROWS);
         return Err(Refusal { why: Rejection::InvalidInput, message });
     }
-    let blobs = (0..n)
-        .map(|_| {
-            let symbols = c.take(BLOB_BYTES).unwrap().as_chunks::<16>().0;
+    let bytes = c.take(n * BLOB_BYTES).ok_or_else(|| malformed("blobs"))?;
+    let blobs = bytes
+        .as_chunks::<BLOB_BYTES>()
+        .0
+        .iter()
+        .map(|blob| {
+            let symbols = blob.as_chunks::<{ size_of::<lean_da::Symbol>() }>().0;
             std::array::from_fn(|i| u128::from_le_bytes(symbols[i]))
         })
         .collect();
@@ -157,7 +158,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn array<const N: usize>(&mut self) -> Option<&'a [u8; N]> {
-        self.take(N).map(|bytes| bytes.try_into().unwrap())
+        let (head, rest) = self.0.split_first_chunk()?;
+        self.0 = rest;
+        Some(head)
     }
 
     fn u8(&mut self) -> Option<u8> {
@@ -182,6 +185,19 @@ impl<'a> Cursor<'a> {
     fn count(&mut self, size: usize) -> Option<usize> {
         let n = usize::try_from(self.u64()?).ok()?;
         (n.checked_mul(size)? <= self.0.len()).then_some(n)
+    }
+
+    fn records<T>(
+        &mut self,
+        size: usize,
+        mut decode: impl FnMut(&mut Self) -> Option<T>,
+    ) -> Option<Vec<T>> {
+        let n = self.count(size)?;
+        let mut records = Vec::with_capacity(n);
+        for _ in 0..n {
+            records.push(decode(self)?);
+        }
+        Some(records)
     }
 
     fn op(&mut self, expected: u8) -> Result<(), Refusal> {
