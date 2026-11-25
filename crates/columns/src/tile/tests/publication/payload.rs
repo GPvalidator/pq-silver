@@ -126,7 +126,7 @@ fn cached_and_submitted_blobs_publish_every_gloas_column() {
             assert_eq!(SidecarIdentity::of(sidecar).unwrap(), SidecarIdentity {
                 slot: SLOT,
                 block_root: ROOT,
-                column_index,
+                column_index
             });
         }
         let mut requests = Vec::new();

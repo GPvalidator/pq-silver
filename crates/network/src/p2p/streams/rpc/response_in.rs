@@ -78,7 +78,7 @@ impl RpcReadResponse {
                         silver_log::warn!(?p2p_id, "rpc read response timeout");
                         return Err(StreamError::ReadResponseTimeout);
                     }
-                    return Ok(read_state)
+                    return Ok(read_state);
                 }
                 Spin::Next(read_state) => {
                     self = read_state;

@@ -248,7 +248,7 @@ fn prove(body: &[u8]) -> Vec<u8> {
         _ => match lean_vm::lean_da::BlobMatrix::build(&request.blobs) {
             Ok(blobs) => Some(blobs),
             Err(e) => {
-                return Refusal { why: Rejection::InvalidInput, message: e.to_string() }.encode()
+                return Refusal { why: Rejection::InvalidInput, message: e.to_string() }.encode();
             }
         },
     };

@@ -93,8 +93,7 @@ pub fn verify_proposer_slashing_signatures_pq(
     data: &[u8],
 ) -> Result<(), ProposerSlashingError> {
     let n = validators.count();
-    for s in data.chunks_exact(PROPOSER_SLASHING_PQ_SIZE) {
-        let s: &[u8; PROPOSER_SLASHING_PQ_SIZE] = s.try_into().unwrap();
+    for s in data.as_chunks::<PROPOSER_SLASHING_PQ_SIZE>().0 {
         let header = ProposerSlashingPqView::header_1(s);
         let vi = BeaconBlockHeaderView::proposer_index(header) as usize;
         if vi >= n {
@@ -405,10 +404,8 @@ impl<'a> SlashedAttestation<'a> {
     /// `proof` over the one statement the attesters sign.
     fn push_claims(&self, claims: &mut StarkClaims, imm: &Immutable, epoch: &EpochReadView) {
         let first_statement = claims.statement_count();
-        let attesters = self
-            .indices
-            .chunks_exact(8)
-            .map(|index| u64::from_le_bytes(index.try_into().unwrap()) as u32);
+        let attesters =
+            self.indices.as_chunks().0.iter().map(|index| u64::from_le_bytes(*index) as u32);
         claims.attestation(imm, epoch, self.data).push(attesters);
         claims.push_proof(first_statement, self.proof);
     }

@@ -163,7 +163,7 @@ pub fn verify_commitments_inclusion_proof(
 ) -> bool {
     let leaf = hash_list(
         MerkleStack::new(MAX_BLOB_COMMITMENTS_PER_BLOCK),
-        commitments.chunks_exact(BYTES_PER_KZG_COMMITMENT).map(hash_fixed_bytes),
+        commitments.as_chunks::<BYTES_PER_KZG_COMMITMENT>().0.iter().map(|c| hash_fixed_bytes(c)),
     );
     is_valid_merkle_branch(
         &leaf,
@@ -444,12 +444,14 @@ pub fn write_data_column_sidecar_fulu<'a>(
         header,
         inclusion_proof,
     ));
-    for (slot, cell) in out[cells_at..commitments_at].chunks_exact_mut(BYTES_PER_CELL).zip(cells) {
-        slot.copy_from_slice(cell);
+    let out_cells = out[cells_at..commitments_at].as_chunks_mut::<BYTES_PER_CELL>().0;
+    for (slot, cell) in out_cells.iter_mut().zip(cells) {
+        *slot = *cell;
     }
     out[commitments_at..proofs_at].copy_from_slice(commitments);
-    for (slot, proof) in out[proofs_at..].chunks_exact_mut(BYTES_PER_KZG_PROOF).zip(proofs) {
-        slot.copy_from_slice(proof);
+    let out_proofs = out[proofs_at..].as_chunks_mut::<BYTES_PER_KZG_PROOF>().0;
+    for (slot, proof) in out_proofs.iter_mut().zip(proofs) {
+        *slot = *proof;
     }
 }
 

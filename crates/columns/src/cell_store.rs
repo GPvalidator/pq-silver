@@ -589,7 +589,7 @@ impl CellStore {
             let index = *self.changed.last()?;
             let Some(block) = self.blocks.get_mut(index) else {
                 self.changed.pop();
-                continue
+                continue;
             };
             if block.changed == 0 || !block.active {
                 self.changed.pop();

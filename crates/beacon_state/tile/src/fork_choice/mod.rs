@@ -111,9 +111,8 @@ impl ForkChoice {
             execution_block_hash: finalized_execution_block_hash,
             parent_ix: NULL,
             execution_status: ExecutionStatus::Valid,
-            descends_from_finalized: finalized_slot <=
-                finalized_checkpoint.epoch * SLOTS_PER_EPOCH &&
-                finalized_block_root == finalized_checkpoint.root,
+            descends_from_finalized: finalized_slot <= finalized_checkpoint.epoch * SLOTS_PER_EPOCH
+                && finalized_block_root == finalized_checkpoint.root,
             state_id,
             weight: 0,
             full: Branch::new_leaf(0),

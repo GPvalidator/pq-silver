@@ -173,7 +173,9 @@ impl<'a> RecordKeys<'a> {
         self.compressed.clear();
         self.compressed.extend(
             records
-                .chunks_exact(VALIDATOR_SSZ_SIZE)
+                .as_chunks::<VALIDATOR_SSZ_SIZE>()
+                .0
+                .iter()
                 .map(|v| BLSPubkey::try_from(&v[..48]).unwrap()),
         );
         self.start = start;

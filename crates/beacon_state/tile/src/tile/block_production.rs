@@ -20,7 +20,7 @@ use silver_common::{
     block_contents::BLOCK_CONTENTS_FIXED,
     ssz_hash::{BlockFork, HashedBody},
     ssz_view::{
-        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BuilderBidFuluView,
+        BEACON_BLOCK_BODY_FIXED, BEACON_BLOCK_FIXED, BYTES_PER_KZG_COMMITMENT, BuilderBidFuluView,
         ExecutionPayloadEnvelopeView, ExecutionPayloadView, MAX_ATTESTATIONS_PQ,
         SYNC_AGGREGATE_SIZE, SignedBuilderBidFuluView, SignedExecutionPayloadBidView, VRFProof,
         XMSS_SIGNATURE_SIZE,
@@ -1419,8 +1419,10 @@ impl BeaconStateTile {
             execution_payment: 0,
             blob_kzg_commitments: frame
                 .commitments
-                .chunks_exact(48)
-                .map(|commitment| commitment.try_into().expect("48 bytes"))
+                .as_chunks::<BYTES_PER_KZG_COMMITMENT>()
+                .0
+                .iter()
+                .copied()
                 .collect(),
             execution_requests_root: requests.hash_tree_root(frame.execution_requests),
         };

@@ -81,7 +81,7 @@ impl SubReservationList {
     }
 
     fn entries(self, bytes: &[u8]) -> impl ExactSizeIterator<Item = SubReservationRef> + '_ {
-        bytes.chunks_exact(ENTRY_BYTES).map(move |entry| SubReservationRef {
+        bytes.as_chunks::<ENTRY_BYTES>().0.iter().map(move |entry| SubReservationRef {
             read: TCacheRead {
                 seq: u64::from_le_bytes(entry[..8].try_into().unwrap()),
                 ..self.read

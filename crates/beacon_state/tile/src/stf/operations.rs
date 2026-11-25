@@ -188,8 +188,7 @@ pub fn process_validator_preregistration_requests(view: &mut StateWriterView, da
     let state = view.slot.state();
     let (expiry_slot, parent_slot) =
         (state.slot + PREREGISTRATION_EXPIRY_SLOTS, state.latest_execution_payload_bid.slot);
-    for request in data.chunks_exact(VALIDATOR_PREREGISTRATION_REQUEST_SIZE) {
-        let request = request.try_into().unwrap();
+    for request in data.as_chunks::<VALIDATOR_PREREGISTRATION_REQUEST_SIZE>().0 {
         let pubkey = *ValidatorPreregistrationRequestView::pubkey(request);
         if view.validators.find_by_pubkey(&xmss_pubkey_padded(&pubkey)).is_some() ||
             pending_keys.contains(&pubkey)
@@ -423,9 +422,8 @@ fn process_consolidation_request(
 #[timed]
 pub fn process_voluntary_exit_requests(view: &mut StateWriterView, cfg: &SpecConfig, data: &[u8]) {
     let current_epoch = view.slot.state().slot / SLOTS_PER_EPOCH;
-    for request in data.chunks_exact(VOLUNTARY_EXIT_REQUEST_SIZE) {
-        let pubkey =
-            xmss_pubkey_padded(VoluntaryExitRequestView::pubkey(request.try_into().unwrap()));
+    for request in data.as_chunks::<VOLUNTARY_EXIT_REQUEST_SIZE>().0 {
+        let pubkey = xmss_pubkey_padded(VoluntaryExitRequestView::pubkey(request));
         let Some(vi) = view.validators.find_by_pubkey(&pubkey) else {
             continue;
         };

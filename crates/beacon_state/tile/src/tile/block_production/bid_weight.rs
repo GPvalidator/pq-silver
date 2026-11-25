@@ -16,8 +16,8 @@ impl BidWeight {
     fn from_wei(wei: &[u8; 32], boost: u64) -> Self {
         let mut limbs = [0; 5];
         let mut carry = 0u128;
-        for (i, bytes) in wei.chunks_exact(8).enumerate() {
-            let value = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+        for (i, bytes) in wei.as_chunks().0.iter().enumerate() {
+            let value = u64::from_le_bytes(*bytes);
             let product = u128::from(value) * u128::from(boost) + carry;
             limbs[4 - i] = product as u64;
             carry = product >> 64;

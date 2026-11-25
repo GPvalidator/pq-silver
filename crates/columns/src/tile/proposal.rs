@@ -127,8 +127,8 @@ impl ProposedBlocks {
             }
         }
 
-        for (blob, bytes) in blobs.chunks_exact(BYTES_PER_BLOB).enumerate() {
-            let Some(cells) = self.cells.compute(bytes.try_into().expect("one blob")) else {
+        for (blob, bytes) in blobs.as_chunks::<BYTES_PER_BLOB>().0.iter().enumerate() {
+            let Some(cells) = self.cells.compute(bytes) else {
                 silver_log::error!(slot, blob, "proposed blob has no cells");
                 return Err(LocalGossipFailure::Invalid);
             };

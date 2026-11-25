@@ -184,7 +184,7 @@ impl CellHandler {
             }
             let Some(available) = self.store.availability(&context.block_root, column as usize)
             else {
-                continue
+                continue;
             };
             if now >= available.expires || available.cell(row).is_some() {
                 continue;
@@ -202,7 +202,7 @@ impl CellHandler {
                 .get(offset..offset + BYTES_PER_KZG_PROOF)
                 .and_then(|proof| proof.try_into().ok())
             else {
-                continue
+                continue;
             };
             let cell = &cells[column as usize];
             match reference.stage(&mut self.reader, row, cell, proof) {
@@ -461,7 +461,7 @@ impl CellHandler {
                 HeaderOutcome::Valid(context) => {
                     self.headers.requests.swap_remove(index);
                     let Some(data) = ContextData::from_encoded(bytes, ForkName::Fulu) else {
-                        continue
+                        continue;
                     };
                     on_context(
                         context,
@@ -509,7 +509,7 @@ impl CellHandler {
                 continue;
             }
             let Some(column) = self.store.availability(&key.block_root, key.column) else {
-                continue
+                continue;
             };
             let Some(assembly) = column.assembly else { continue };
             self.pending.requests.swap_remove(index);
@@ -599,7 +599,7 @@ impl CellHandler {
         loop {
             let Some((root, column)) = self.store.next_changed() else { return };
             let Ok(update) = self.store.refresh_column(&root, column, &mut self.reader) else {
-                continue
+                continue;
             };
             let Some(available) = self.store.availability(&root, column) else { continue };
             producers.produce(CellStoreEvent::Available(available));

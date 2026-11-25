@@ -208,7 +208,7 @@ impl ProposerPreparation {
     }
 
     pub fn decode_all(bytes: &[u8]) -> impl Iterator<Item = Self> {
-        bytes.chunks_exact(Self::SIZE).map(|record| Self {
+        bytes.as_chunks::<{ Self::SIZE }>().0.iter().map(|record| Self {
             validator_index: u64::from_le_bytes(record[..8].try_into().expect("8 bytes")),
             fee_recipient: record[8..Self::SIZE].try_into().expect("20 bytes"),
         })
@@ -254,7 +254,7 @@ impl SlotSubnets {
         let word = |record: &[u8], at: usize| {
             u64::from_le_bytes(record[at..at + 8].try_into().expect("8 bytes"))
         };
-        bytes.chunks_exact(Self::SIZE).map(move |record| Self {
+        bytes.as_chunks::<{ Self::SIZE }>().0.iter().map(move |record| Self {
             slot: word(record, 0),
             attesting: word(record, 8),
             aggregating: word(record, 16),

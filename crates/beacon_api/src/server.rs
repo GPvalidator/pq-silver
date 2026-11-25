@@ -453,7 +453,10 @@ impl Requests {
                 loop {
                     match stream.write(self.http.pending_write()) {
                         Ok(0) => {
-                            return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write returned 0",
+                            ));
                         }
                         Ok(n) => {
                             self.last_activity = now;

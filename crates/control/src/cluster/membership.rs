@@ -250,10 +250,8 @@ fn split_members(bytes: &[u8]) -> io::Result<(Vec<Member>, &[u8])> {
         .filter(|&len| len <= rest.len())
         .ok_or_else(truncated)?;
     let (members, rest) = rest.split_at(len);
-    let members = members
-        .chunks_exact(MEMBER_LEN)
-        .map(|member| Member::decode(member.try_into().expect("chunk is one member")))
-        .collect::<io::Result<_>>()?;
+    let members = members.as_chunks::<MEMBER_LEN>().0;
+    let members = members.iter().map(Member::decode).collect::<io::Result<_>>()?;
     Ok((members, rest))
 }
 

@@ -159,8 +159,7 @@ impl<'a> AggregateResponse<'a> {
     fn parse_claims(mut bytes: &[u8]) -> Option<Vec<Claim>> {
         let count = take_u64(&mut bytes).filter(|&count| count <= MAX_PROOF_CLAIMS)?;
         let claim_bytes = take(&mut bytes, count.checked_mul(64)?)?;
-        let claims: Vec<Claim> =
-            claim_bytes.chunks_exact(64).map(|c| c.try_into().unwrap()).collect();
+        let claims: Vec<Claim> = claim_bytes.as_chunks().0.to_vec();
         let sorted = claims.windows(2).all(|pair| pair[0] < pair[1]);
         let no_sphincs_and_no_da = take_u64(&mut bytes)? == 0 && take(&mut bytes, 1)? == [0];
         (sorted && no_sphincs_and_no_da && bytes.is_empty()).then_some(claims)

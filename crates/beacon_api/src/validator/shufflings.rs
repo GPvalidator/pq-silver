@@ -64,11 +64,7 @@ impl Shuffling {
     fn fill(&mut self, id: ShufflingId, bytes: &[u8]) {
         self.id = Some(id);
         self.order.clear();
-        self.order.extend(
-            bytes
-                .chunks_exact(size_of::<u32>())
-                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes"))),
-        );
+        self.order.extend(bytes.as_chunks().0.iter().copied().map(u32::from_le_bytes));
         self.position_of.clear();
         for (position, &validator_index) in self.order.iter().enumerate() {
             let ix = validator_index as usize;

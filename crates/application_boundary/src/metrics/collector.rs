@@ -261,7 +261,7 @@ impl Collector {
     fn discover_one(&mut self) {
         let Some(entry) = self.entries.as_mut().and_then(Iterator::next) else {
             self.entries = None;
-            return
+            return;
         };
         let Ok(entry) = entry else { return };
         let Ok(file) = entry.file_name().into_string() else { return };

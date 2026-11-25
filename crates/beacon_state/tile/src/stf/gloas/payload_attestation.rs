@@ -20,7 +20,7 @@ fn bit_set(bits: &[u8], i: usize) -> bool {
 }
 
 pub fn process_payload_attestations(view: &StateWriterView, section: &[u8]) -> Result<(), E> {
-    for pa in section.chunks_exact(PAYLOAD_ATTESTATION_SIZE) {
+    for pa in section.as_chunks::<PAYLOAD_ATTESTATION_SIZE>().0 {
         process_payload_attestation(view, pa)?;
     }
 
@@ -64,7 +64,7 @@ pub fn collect_sigs_payload_attestations(
     section: &[u8],
     batch: &mut SigBatch,
 ) -> Result<(), E> {
-    for pa in section.chunks_exact(PAYLOAD_ATTESTATION_SIZE) {
+    for pa in section.as_chunks::<PAYLOAD_ATTESTATION_SIZE>().0 {
         collect_sigs_payload_attestation(
             imm,
             validators,

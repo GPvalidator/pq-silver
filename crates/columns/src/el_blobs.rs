@@ -90,7 +90,7 @@ impl PendingBlobFetch {
         for (hash, commitment) in request
             .hashes
             .iter_mut()
-            .zip(self.data().commitments().chunks_exact(BYTES_PER_KZG_COMMITMENT))
+            .zip(self.data().commitments().as_chunks::<BYTES_PER_KZG_COMMITMENT>().0)
         {
             *hash = util::kzg_commitment_to_versioned_hash(commitment);
         }

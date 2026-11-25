@@ -53,8 +53,8 @@ const HEX_PAIRS: [[u8; 2]; 256] = {
 /// A little-endian `uint256` in decimal, as the schemas spell Wei.
 pub(crate) fn wei_decimal(little_endian: &[u8; 32]) -> String {
     let mut limbs = [0u64; 4];
-    for (limb, bytes) in limbs.iter_mut().zip(little_endian.chunks_exact(8)) {
-        *limb = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+    for (limb, bytes) in limbs.iter_mut().zip(little_endian.as_chunks().0) {
+        *limb = u64::from_le_bytes(*bytes);
     }
     let mut digits = Vec::new();
     loop {
@@ -153,8 +153,8 @@ impl<'a> Json<'a> {
         self.out.extend_from_slice(b"\"0x");
         let base = self.out.len();
         self.out.resize(base + bytes.len() * 2, 0);
-        for (pair, byte) in self.out[base..].chunks_exact_mut(2).zip(bytes) {
-            pair.copy_from_slice(&HEX_PAIRS[*byte as usize]);
+        for (pair, byte) in self.out[base..].as_chunks_mut().0.iter_mut().zip(bytes) {
+            *pair = HEX_PAIRS[*byte as usize];
         }
         self.out.push(b'"');
     }
@@ -555,8 +555,8 @@ impl Json<'_> {
         self.hex(&attributes.fee_recipient);
         self.key("withdrawals");
         self.begin_array();
-        for withdrawal in withdrawals_ssz.chunks_exact(WITHDRAWAL_SIZE) {
-            self.withdrawal(withdrawal.try_into().unwrap());
+        for withdrawal in withdrawals_ssz.as_chunks::<WITHDRAWAL_SIZE>().0 {
+            self.withdrawal(withdrawal);
         }
         self.end_array();
         self.key("parent_beacon_block_root");
@@ -1094,8 +1094,8 @@ impl Json<'_> {
         self.begin_object();
         self.key("attesting_indices");
         self.begin_array();
-        for index in IndexedAttestationPqView::attesting_indices(ssz).chunks_exact(8) {
-            self.quoted_u64(u64::from_le_bytes(index.try_into().unwrap()));
+        for index in IndexedAttestationPqView::attesting_indices(ssz).as_chunks().0 {
+            self.quoted_u64(u64::from_le_bytes(*index));
         }
         self.end_array();
         self.key("data");
@@ -1136,7 +1136,7 @@ impl Json<'_> {
             debug_assert!(commitments.len().is_multiple_of(BYTES_PER_KZG_COMMITMENT));
             self.key("kzg_commitments");
             self.begin_array();
-            for commitment in commitments.chunks_exact(BYTES_PER_KZG_COMMITMENT) {
+            for commitment in commitments.as_chunks::<BYTES_PER_KZG_COMMITMENT>().0 {
                 self.hex(commitment);
             }
             self.end_array();

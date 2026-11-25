@@ -25,7 +25,7 @@ pub(super) fn codeword(digest: &Digest) -> Option<[u8; CHAINS]> {
 /// One hash of the secret seeds two chains: `2j` and `2j + 1` are its halves.
 fn chain_starts(secret: &Secret, layer: u32, e: u32) -> [Digest; CHAINS] {
     let mut starts = [[0u8; 16]; CHAINS];
-    for (j, pair) in starts.chunks_exact_mut(2).enumerate() {
+    for (j, pair) in starts.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let hash = h(&secret.p, &address(PRF, 0, hi(layer, j as u32), e), &secret.s);
         pair[0].copy_from_slice(&hash[..16]);
         pair[1].copy_from_slice(&hash[16..]);

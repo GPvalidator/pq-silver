@@ -103,8 +103,8 @@ fn parse_uint256(text: &str) -> Option<[u8; 32]> {
         }
     }
     let mut out = [0; 32];
-    for (bytes, limb) in out.chunks_exact_mut(8).zip(limbs) {
-        bytes.copy_from_slice(&limb.to_le_bytes());
+    for (bytes, limb) in out.as_chunks_mut().0.iter_mut().zip(limbs) {
+        *bytes = limb.to_le_bytes();
     }
     Some(out)
 }

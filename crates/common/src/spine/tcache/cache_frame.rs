@@ -236,7 +236,9 @@ impl CacheFrameView {
 
     pub fn segments(&self) -> impl ExactSizeIterator<Item = CacheFrameSegment> + '_ {
         self.read.buffer().expect("acquired descriptor").0[HEADER_BYTES..self.framing_start]
-            .chunks_exact(SEGMENT_BYTES)
+            .as_chunks::<SEGMENT_BYTES>()
+            .0
+            .iter()
             .map(|entry| CacheFrameSegment::decode(entry, self.framing_start))
     }
 

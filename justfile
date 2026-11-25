@@ -52,11 +52,11 @@ fmt-check:
 lint_features := "$(cargo metadata --locked --no-deps --format-version 1 | perl -MJSON::PP -0777 -ne 'print join \",\", map { my $p = $_->{name}; map { \"$p/$_\" } grep { !/^(default|minimal)$/ } sort keys %{$_->{features}} } @{decode_json($_)->{packages}}')"
 
 clippy: log-check
-	cargo clippy --locked --features "{{lint_features}}" --no-deps -- -D warnings -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
+	cargo clippy --locked --features "{{lint_features}}" --no-deps -- -D warnings -A clippy::collapsible_if
 
 # Lints what `clippy` lints, then type-checks every target (tests included).
 clippy-minimal:
-	cargo clippy --locked --features "{{lint_features}},silver_preset/minimal" --no-deps -- -D warnings -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
+	cargo clippy --locked --features "{{lint_features}},silver_preset/minimal" --no-deps -- -D warnings -A clippy::collapsible_if
 	cargo check --locked --features "{{lint_features}},silver_preset/minimal" --all-targets
 
 # Logs go through `silver_log`. This reads our source, not expanded code, so
@@ -65,7 +65,7 @@ log-check:
 	! find crates -name '*.rs' -not -path 'crates/log/*' -exec perl -0777 -ne 'print "$ARGV\n" if /\btracing::(trace|debug|info|warn|error)!|\buse (::)?(flux::)?tracing::(\{[^;]*\b)?(trace|debug|info|warn|error)\b/' {} + | grep .
 
 clippy-fix:
-	cargo clippy --fix --locked --features "{{lint_features}}" --no-deps --allow-dirty -- -D warnings -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
+	cargo clippy --fix --locked --features "{{lint_features}}" --no-deps --allow-dirty -- -D warnings -A clippy::collapsible_if
 
 machete:
   cargo install --locked cargo-machete && \

@@ -147,9 +147,9 @@ pub struct BottomTree {
 
 fn build_tree(secret: &Secret, layer: u32, first: u32) -> Tree {
     let mut leaves = vec![[0u8; 16]; LEAVES];
-    for (group, out) in leaves.chunks_exact_mut(LANES).enumerate() {
+    for (group, out) in leaves.as_chunks_mut::<LANES>().0.iter_mut().enumerate() {
         let e = std::array::from_fn(|l| first + (group * LANES + l) as u32);
-        out.copy_from_slice(&ots_leaves(secret, layer, &e));
+        *out = ots_leaves(secret, layer, &e);
     }
     Tree::build(&secret.p, layer, first, &leaves)
 }

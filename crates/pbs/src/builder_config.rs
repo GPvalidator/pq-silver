@@ -115,9 +115,7 @@ impl<'a> BuilderEntry<'a> {
 
     /// Empty accepts any builder.
     pub fn builder_pubkeys(&self) -> impl Iterator<Item = &'a BLSPubkey> {
-        self.builder_pubkeys
-            .chunks_exact(size_of::<BLSPubkey>())
-            .map(|pubkey| pubkey.try_into().expect("chunk is one pubkey"))
+        self.builder_pubkeys.as_chunks().0.iter()
     }
 
     pub fn max_execution_payment(&self) -> u64 {

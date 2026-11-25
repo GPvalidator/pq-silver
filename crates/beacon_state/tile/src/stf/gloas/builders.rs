@@ -141,8 +141,7 @@ pub fn process_builder_preregistration_requests(view: &mut StateWriterView, data
     let state = view.slot.state();
     let (expiry_slot, parent_slot) =
         (state.slot + PREREGISTRATION_EXPIRY_SLOTS, state.latest_execution_payload_bid.slot);
-    for request in data.chunks_exact(BUILDER_PREREGISTRATION_REQUEST_SIZE) {
-        let request = request.try_into().unwrap();
+    for request in data.as_chunks::<BUILDER_PREREGISTRATION_REQUEST_SIZE>().0 {
         let pubkey = *BuilderPreregistrationRequestView::pubkey(request);
         if view.builders.reader().find_by_pubkey(&xmss_pubkey_padded(&pubkey)).is_some() {
             continue;

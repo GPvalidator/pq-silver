@@ -96,7 +96,7 @@ impl PartialExchange {
             let Some(column) =
                 ingress.availability(&key.group.block_root, key.group.column as usize, now)
             else {
-                continue
+                continue;
             };
             if self.admit(key, column.slot, column.blob_count, column.expires, now).is_some() {
                 self.schedule(key);
