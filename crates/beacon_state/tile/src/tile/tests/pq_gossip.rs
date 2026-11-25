@@ -484,7 +484,7 @@ fn proven_aggregate_is_merged_for_a_local_proposal_that_packs_it() {
 
         let signed = &aggregate.signed;
         let msg = pq_gossip_msg(&tile, &mut gossip, signed, GossipTopic::BeaconAggregateAndProof);
-        tile.leanvm_verifier = LeanVmVerifier::fixed(true);
+        tile.leanvm_verifier = LeanVmVerifier::Fixed(true);
         tile.handle_gossip(msg.ssz, msg, true, false, &mut adapter.producers);
         adapter.consume(|_: LeanVmReq, _| {});
 
@@ -510,14 +510,14 @@ fn aggregate_counts_only_once_signed_and_proven() {
         gossip_verdicts(adapter)
     };
 
-    tile.leanvm_verifier = LeanVmVerifier::fixed(true);
+    tile.leanvm_verifier = LeanVmVerifier::Fixed(true);
     aggregate.sign(&key, LeafOffset::BeaconProposer);
     let sent = send(&mut tile, &mut adapter, &aggregate.signed);
     assert_eq!(sent, (0, 1), "signed at another duty's leaf");
 
     aggregate.sign(&key, LeafOffset::AggregateAndProof);
     for valid in [false, true] {
-        tile.leanvm_verifier = LeanVmVerifier::fixed(valid);
+        tile.leanvm_verifier = LeanVmVerifier::Fixed(valid);
         let verdicts = send(&mut tile, &mut adapter, &aggregate.signed);
         assert_eq!(verdicts, if valid { (1, 0) } else { (0, 1) });
         assert_eq!(tile.seen_aggregators.contains(2, aggregate.aggregator), valid);

@@ -43,7 +43,6 @@ use super::{
     block::{ParsedBlock, StagedBlock},
     block_production::Proposal,
     held_blocks::{BlockSourceMsg, ORPHAN_TIMEOUT_SLOTS},
-    leanvm_verifier::ProofVerdict,
     pending_envelopes::{ParkedEnvelope, ParkedKind, UnverifiedEnvelope},
     shuffling_cache::ShufflingRequest,
     *,
@@ -5208,12 +5207,6 @@ impl ThreeForks {
         Self::on(make_tile())
     }
 
-    /// The producer writes block bytes the tile can read back.
-    fn with_gossip() -> (Self, TProducer) {
-        let (tile, gossip, _rpc) = make_tile_with_gossip(1, BeaconState::empty_test(0));
-        (Self::on(tile), gossip)
-    }
-
     fn on(mut tile: BeaconStateTile) -> Self {
         seed_tile(&mut tile, 4, 0);
         let anchor_id = tile.last_applied;
@@ -5254,36 +5247,6 @@ impl ThreeForks {
         parent: StateId,
         slot: Slot,
     ) -> StateId {
-        let (block, id) = self.applied_block(producer, root, parent_root, parent, slot);
-        self.tile.held.stage(block);
-        id
-    }
-
-    /// A block parked on its STARK verdict: STF committed to `id`, not in
-    /// fork choice.
-    /// Parks under verify request ids `slot * 10 ..`, one per proof.
-    fn park_for_verify(
-        &mut self,
-        producer: &mut TProducer,
-        root: B256,
-        parent_root: B256,
-        parent: StateId,
-        slot: Slot,
-        proofs: u64,
-    ) -> StateId {
-        let (block, id) = self.applied_block(producer, root, parent_root, parent, slot);
-        self.tile.held.park_for_verify(block, slot * 10..slot * 10 + proofs);
-        id
-    }
-
-    fn applied_block(
-        &mut self,
-        producer: &mut TProducer,
-        root: B256,
-        parent_root: B256,
-        parent: StateId,
-        slot: Slot,
-    ) -> (StagedBlock, StateId) {
         let id = self.roll(parent, slot, root);
         let BlockSourceMsg::Gossip(_, ssz) = gossip_pending(&mut self.tile, producer, slot) else {
             unreachable!()
@@ -5304,7 +5267,8 @@ impl ThreeForks {
             parent_payload_status: PayloadStatus::Full,
             relay_eligible: false,
         };
-        (StagedBlock::with_state_id(parsed, id, ssz, BlockSource::Gossip), id)
+        self.tile.held.stage(StagedBlock::with_state_id(parsed, id, ssz, BlockSource::Gossip));
+        id
     }
 }
 
@@ -5461,71 +5425,6 @@ fn el_valid_is_kept_on_a_staged_block() {
     assert!(staged.el_valid);
 }
 
-/// Each proof is its own request, so the block imports on the last `Valid`.
-#[test]
-fn stark_valid_imports_parked_block_once_every_proof_verifies() {
-    const S_ROOT: B256 = [0x05; 32];
-    let (mut forks, mut producer) = ThreeForks::with_gossip();
-    let (_spine, mut adapter) = spine_adapter(&forks.tile);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 2);
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none(), "out until verified");
-
-    forks.tile.handle_stark_verdict(31, ProofVerdict::Valid, &mut adapter.producers);
-    assert!(forks.tile.held.is_awaiting_verify(&S_ROOT), "one proof still out");
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Valid, &mut adapter.producers);
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_some(), "imported");
-}
-
-/// An invalid proof fails the block's transition: it never enters fork
-/// choice, and a re-delivered copy is not run again.
-#[test]
-fn stark_invalid_rejects_parked_block() {
-    const S_ROOT: B256 = [0x05; 32];
-    let mut forks = ThreeForks::new();
-    let (mut spine, mut adapter) = spine_adapter(&forks.tile);
-    let mut sink = SpineAdapter::connect_tile(&Sink, &mut spine.spine);
-    sink.consume(|_: BeaconStateEvent, _| {});
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 2);
-
-    forks.tile.handle_stark_verdict(31, ProofVerdict::Invalid, &mut adapter.producers);
-    forks.tile.handle_stark_verdict(30, ProofVerdict::Valid, &mut adapter.producers);
-
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
-    assert!(forks.tile.fork_choice.find_node_idx(&S_ROOT).is_none());
-    assert_eq!(forks.tile.held.rejected_reason(&S_ROOT), Some(RejectReason::FailedTransition));
-    let mut rejected = Vec::new();
-    sink.consume(|event: BeaconStateEvent, _| {
-        if let BeaconStateEvent::BlockRejected { block_root, .. } = event {
-            rejected.push(block_root);
-        }
-    });
-    assert_eq!(rejected, [S_ROOT], "the peer that served it is told");
-}
-
-/// A block parked on its verdict holds a committed state, so finalization
-/// re-anchors it like a staged block.
-#[test]
-fn parked_blocks_follow_finalization() {
-    const S_ROOT: B256 = [0x05; 32];
-    const S2_ROOT: B256 = [0x52; 32];
-    let mut forks = ThreeForks::new();
-    let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    let s_id = forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
-    forks.park_for_verify(&mut producer, S2_ROOT, F2_ROOT, forks.f2_id, 2, 1);
-
-    forks.tile.maybe_finalize();
-
-    let held = &mut forks.tile.held;
-    assert!(!held.is_awaiting_verify(&S2_ROOT), "S2 dropped with F2");
-    assert!(held.is_awaiting_verify(&S_ROOT), "S survives");
-    let s_rebased = *held.state_ids_mut().next().expect("S is the only held block");
-    assert_ne!(s_rebased, s_id, "stale bundle replaced");
-}
-
 /// Finality at or past a held block's slot leaves it beside the finalized
 /// block, even with its parent kept: it can no longer import.
 #[test]
@@ -5533,22 +5432,22 @@ fn held_blocks_at_or_below_the_finalized_slot_are_dropped() {
     const S_ROOT: B256 = [0x05; 32];
     let mut forks = ThreeForks::new();
     let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
+    forks.stage(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3);
 
     forks.tile.held.drop_outdated(2, |_| true);
-    assert!(forks.tile.held.is_awaiting_verify(&S_ROOT));
+    assert!(forks.tile.held.is_staged(&S_ROOT));
     forks.tile.held.drop_outdated(3, |_| true);
-    assert!(!forks.tile.held.is_awaiting_verify(&S_ROOT));
+    assert!(!forks.tile.held.is_staged(&S_ROOT));
 }
 
-/// A block parked on its verdict is not in fork choice, yet a second
-/// proposal for its slot still equivocates against it.
+/// A staged block is not in fork choice, yet a second proposal for its slot
+/// still equivocates against it.
 #[test]
-fn a_parked_block_counts_toward_equivocation() {
+fn a_staged_block_counts_toward_equivocation() {
     const S_ROOT: B256 = [0x05; 32];
     let mut forks = ThreeForks::new();
     let mut producer = TCache::producer(TCacheId::ControlProcessing, 1 << 12);
-    forks.park_for_verify(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3, 1);
+    forks.stage(&mut producer, S_ROOT, D_ROOT, forks.d_id, 3);
 
     assert!(forks.tile.equivocates(3, 0, &[0x06; 32]));
     assert!(!forks.tile.equivocates(3, 0, &S_ROOT), "not against itself");
@@ -7745,20 +7644,7 @@ fn gloas_head_on_a_pending_full_parent_payload_is_optimistic_until_that_verdict(
 mod leanvm_verifier {
     use lean_vm::{OutputClaims, lean_xmss};
 
-    use crate::tile::leanvm_verifier::{LeanVmVerifier, ProofVerdict};
-
-    /// Each proof is judged when verified, and its verdict waits under the
-    /// id it returned, in order.
-    #[test]
-    fn verdicts_wait_in_order_under_their_ids() {
-        let mut verifier = LeanVmVerifier::default();
-        let first = verifier.verify([[1; 64], [2; 64]], b"proof");
-        let second = verifier.verify([[2; 64], [1; 64], [1; 64]], &[]);
-        assert_eq!(second, first + 1);
-        assert_eq!(verifier.take_verdict(), Some((first, ProofVerdict::Invalid)));
-        assert_eq!(verifier.take_verdict(), Some((second, ProofVerdict::Invalid)));
-        assert_eq!(verifier.take_verdict(), None);
-    }
+    use crate::tile::leanvm_verifier::LeanVmVerifier;
 
     /// Claims in silver's form, `pubkey | message` in any order, judge a real
     /// proof as leanVM's own claims do.
@@ -7791,10 +7677,8 @@ mod leanvm_verifier {
 
         let mut verifier = LeanVmVerifier::default();
         LeanVmVerifier::warm_up();
-        let all = verifier.verify(claims.iter().copied(), &proof);
-        let fewer = verifier.verify(claims[1..].iter().copied(), &proof);
-        assert_eq!(verifier.take_verdict(), Some((all, ProofVerdict::Valid)));
-        assert_eq!(verifier.take_verdict(), Some((fewer, ProofVerdict::Invalid)), "a claim short");
+        assert!(verifier.verify(claims.iter().copied(), &proof));
+        assert!(!verifier.verify(claims[1..].iter().copied(), &proof), "a claim short");
     }
 }
 

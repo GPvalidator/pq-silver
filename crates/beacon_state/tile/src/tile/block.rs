@@ -1,11 +1,8 @@
-use std::ops::Range;
-
 use flux::{spine::SpineProducers, timing::Nanos};
 use flux_profiler::timed;
 use silver_beacon_state_data::{
     B256, BeaconBlockHeader, BodyFork, BodyOffsets, Checkpoint, Epoch, ForkWriter, SLOTS_PER_EPOCH,
     Slot, StateId, StateReadView, StateView, bls, hash_tree_root_block_header,
-    pq::xmss_pubkey,
     xmss::{LeafOffset, SignatureCheck, compute_xmss_leaf_index},
 };
 use silver_common::{
@@ -18,10 +15,7 @@ use silver_common::{
 use super::{
     BeaconStateTile, Feedback, MAXIMUM_GOSSIP_CLOCK_DISPARITY, Producers,
     gossip::EnvelopeCheck,
-    held_blocks::VerifyProgress,
-    leanvm_verifier::ProofVerdict,
     pending_envelopes::{ParkedEnvelope, ParkedKind},
-    pq_aggregation::claim,
 };
 use crate::{
     Error,
@@ -138,14 +132,18 @@ impl StagedBlock {
 pub(super) enum ImportGate {
     Now,
     DataColumns(TRead, BlockSource),
-    StarkVerdict(TRead, BlockSource),
+}
+
+/// When a block's transition passed, and what its import waited on.
+pub(super) struct StfDone {
+    at: Nanos,
+    gate: StfGate,
 }
 
 /// The root and stage of a block held back from import.
 fn held_stage(feedback: Feedback) -> Option<(B256, BlockStage)> {
     match feedback {
         Feedback::AwaitData(root) => Some((root, BlockStage::AwaitData)),
-        Feedback::AwaitVerify(root) => Some((root, BlockStage::AwaitVerify)),
         _ => None,
     }
 }
@@ -155,7 +153,7 @@ impl BeaconStateTile {
         match self.parse_and_verify_block(data, false) {
             Ok(parsed) => {
                 let feedback = match self.apply_or_reject(&parsed, data) {
-                    Ok(applied) => {
+                    Ok((applied, _)) => {
                         let block_root = parsed.block_root;
                         self.import_block(parsed, applied, data, emit);
                         Feedback::BlockImported(block_root)
@@ -189,11 +187,6 @@ impl BeaconStateTile {
             }
         };
 
-        // Before the XMSS proposer signature, the costliest check a PQ block has.
-        if layout == SignedBlockLayout::Pq && self.held_is_full(self.held.awaiting_verify_len()) {
-            return Feedback::Ignore;
-        }
-
         let slot = layout.slot(data);
         let validated_at;
         let parsed = match self.parse_and_verify_block(data, pre_verified) {
@@ -206,9 +199,6 @@ impl BeaconStateTile {
             }
             Err(PrecheckError::AwaitingData { block_root }) => {
                 return self.still_held(data, Feedback::AwaitData(block_root), source, producers);
-            }
-            Err(PrecheckError::AwaitingVerify { block_root }) => {
-                return self.still_held(data, Feedback::AwaitVerify(block_root), source, producers);
             }
             Err(e) => {
                 let f = e.feedback();
@@ -232,9 +222,7 @@ impl BeaconStateTile {
             }
         };
 
-        let gate = if parsed.fork == BlockFork::Pq {
-            ImportGate::StarkVerdict(ssz.clone(), source)
-        } else if self.waits_for_columns(&parsed) {
+        let gate = if self.waits_for_columns(&parsed) {
             if self.held_is_full(self.held.staged_len()) {
                 return Feedback::Ignore;
             }
@@ -253,32 +241,25 @@ impl BeaconStateTile {
         }
 
         let block_root = parsed.block_root;
-        // A STARK-gated block imported at once had nothing for leanVM: it is
-        // this node's own, or carries no aggregate to prove.
-        let unverified = match gate {
-            ImportGate::StarkVerdict(..) if self.block_production.holds_state_of(&block_root) => {
-                StfGate::OwnBlock
+        let f = match self.apply_and_import(parsed, data, gate, producers) {
+            Ok(StfDone { at, gate: StfGate::Data }) => {
+                let stf = Some(StfStamp { validated_at, applied_at: at, gate: StfGate::Data });
+                let stage = BlockStage::AwaitData;
+                self.emit_block_received(data, block_root, stage, source, stf, producers);
+                Feedback::AwaitData(block_root)
             }
-            ImportGate::StarkVerdict(..) => StfGate::NoAttestations,
-            _ => StfGate::Now,
+            Ok(StfDone { at, gate }) => {
+                let stf = Some(StfStamp { validated_at, applied_at: at, gate });
+                let stage = BlockStage::Applied;
+                self.emit_block_received(data, block_root, stage, source, stf, producers);
+                self.announce_imported(block_root, slot, ssz.to_read(), source, producers);
+                Feedback::BlockImported(block_root)
+            }
+            Err(feedback) => {
+                producers.produce(BeaconStateEvent::BlockRejected { block_root, source });
+                feedback
+            }
         };
-        let f = self.apply_and_import(parsed, data, gate, producers);
-        let mut announce = |stage, gate| {
-            let stf = Some(StfStamp { validated_at, applied_at: Nanos::now(), gate });
-            self.emit_block_received(data, block_root, stage, source, stf, producers)
-        };
-        match f {
-            Feedback::BlockImported(_) => {
-                announce(BlockStage::Applied, unverified);
-                self.announce_imported(block_root, slot, ssz.to_read(), source, producers)
-            }
-            Feedback::AwaitData(_) => announce(BlockStage::AwaitData, StfGate::Data),
-            Feedback::AwaitVerify(_) => announce(BlockStage::AwaitVerify, StfGate::Verify),
-            Feedback::Reject { .. } => {
-                producers.produce(BeaconStateEvent::BlockRejected { block_root, source })
-            }
-            _ => {}
-        }
         silver_log::info!(
             ?source,
             head_slot = self.head_state_slot(),
@@ -514,89 +495,22 @@ impl BeaconStateTile {
     /// The STF, then the fork-choice import, unless `gate` holds the applied
     /// block back.
     #[timed]
-    pub(super) fn apply_and_import(
+    fn apply_and_import(
         &mut self,
         parsed: ParsedBlock,
         data: &[u8],
         gate: ImportGate,
         producers: &mut Producers,
-    ) -> Feedback {
-        let applied = match self.apply_or_reject(&parsed, data) {
-            Ok(applied) => applied,
-            Err(feedback) => return feedback,
-        };
-        let block_root = parsed.block_root;
+    ) -> Result<StfDone, Feedback> {
+        let (applied, done) = self.apply_or_reject(&parsed, data)?;
         match gate {
             ImportGate::Now => {
                 self.import_block(parsed, applied, data, |event| producers.produce(event));
-                Feedback::BlockImported(block_root)
+                Ok(done)
             }
             ImportGate::DataColumns(ssz, source) => {
                 self.held.stage(StagedBlock { parsed, applied, ssz, source, el_valid: false });
-                Feedback::AwaitData(block_root)
-            }
-            ImportGate::StarkVerdict(ssz, source) => {
-                let requests = self.verify_stark_proofs(data, applied.id);
-                if requests.is_empty() {
-                    self.import_block(parsed, applied, data, |event| producers.produce(event));
-                    Feedback::BlockImported(block_root)
-                } else {
-                    let block = StagedBlock { parsed, applied, ssz, source, el_valid: false };
-                    self.held.park_for_verify(block, requests);
-                    Feedback::AwaitVerify(block_root)
-                }
-            }
-        }
-    }
-
-    /// Verifies each STARK proof collected from `data`, before the next
-    /// collection reuses them: the ids their verdicts come under.
-    pub(super) fn verify_stark_proofs(&mut self, data: &[u8], state_id: StateId) -> Range<u64> {
-        let Self { state, stf_scratch, leanvm_verifier, .. } = self;
-        let validators = &state.read_view(state_id).validators;
-        let first = leanvm_verifier.next_request_id();
-        for (signed, proof) in stf_scratch.stark.proofs(data) {
-            let claims = signed.map(|(signer, message)| {
-                claim(xmss_pubkey(validators.pubkey(signer as usize)), message)
-            });
-            leanvm_verifier.verify(claims, proof);
-        }
-        first..leanvm_verifier.next_request_id()
-    }
-
-    /// Hands a verdict to the block waiting on it.
-    pub(super) fn settle_proof(
-        &mut self,
-        request_id: u64,
-        verdict: ProofVerdict,
-        producers: &mut Producers,
-    ) {
-        silver_log::debug!(request_id, ?verdict, "leanvm proof verdict");
-        self.handle_stark_verdict(request_id, verdict, producers);
-    }
-
-    pub(super) fn handle_stark_verdict(
-        &mut self,
-        request_id: u64,
-        verdict: ProofVerdict,
-        producers: &mut Producers,
-    ) {
-        match self.held.on_proof_verdict(request_id, verdict) {
-            VerifyProgress::NotHeld => {
-                silver_log::debug!(request_id, "STARK verdict for a block no longer held")
-            }
-            VerifyProgress::Waiting => {}
-            VerifyProgress::Verified(block) => self.import_held(block, producers),
-            VerifyProgress::Rejected(block) => {
-                let block_root = block.parsed.block_root;
-                silver_log::warn!(
-                    block = hex32(&block_root),
-                    "leanVM rejected the block's STARK proofs"
-                );
-                self.pq_aggregator.on_block_settled(block.parsed.header.slot, &self.ticker);
-                self.stf_scratch.votes.recycle(block.applied.votes);
-                let source = block.source;
-                producers.produce(BeaconStateEvent::BlockRejected { block_root, source });
+                Ok(StfDone { gate: StfGate::Data, ..done })
             }
         }
     }
@@ -606,7 +520,7 @@ impl BeaconStateTile {
         &mut self,
         parsed: &ParsedBlock,
         data: &[u8],
-    ) -> Result<AppliedBlock, Feedback> {
+    ) -> Result<(AppliedBlock, StfDone), Feedback> {
         match self.apply_stf_and_commit(parsed, data) {
             Ok(applied) => Ok(applied),
             Err(e) => {
@@ -661,20 +575,20 @@ impl BeaconStateTile {
         self.announce_imported(block_root, slot, ssz.to_read(), source, producers);
     }
 
-    /// Run the per-block STF against a COW child of the parent post-state and
-    /// commit it. Holds the `&mut self.state` borrow for the whole transition
-    /// (ending at `commit`), then returns the committed `StateId`, the post-
-    /// state justified checkpoint, and the execution block hash.
+    /// Run the per-block STF against a COW child of the parent post-state,
+    /// verify the block's STARK proofs, and commit it. Holds the `&mut
+    /// self.state` borrow for the whole transition (ending at `commit`).
     #[timed]
     fn apply_stf_and_commit(
         &mut self,
         parsed: &ParsedBlock,
         data: &[u8],
-    ) -> crate::Result<AppliedBlock> {
+    ) -> crate::Result<(AppliedBlock, StfDone)> {
+        let pq = parsed.fork == BlockFork::Pq;
         if let Some(applied) = self.block_production.take_produced_state(&parsed.block_root) {
-            // Its proofs are this node's own: none goes to leanVM.
-            self.stf_scratch.stark.begin(parsed.layout.body(data));
-            return Ok(applied);
+            // Its proofs are this node's own, so none is verified.
+            let gate = if pq { StfGate::OwnBlock } else { StfGate::Now };
+            return Ok((applied, StfDone { at: Nanos::now(), gate }));
         }
         let block_epoch = parsed.header.slot / SLOTS_PER_EPOCH;
 
@@ -713,7 +627,7 @@ impl BeaconStateTile {
             fork: parsed.fork,
             shuffling: &sref,
         };
-        let stubbed = self.xmss_stubbed && parsed.fork == BlockFork::Pq;
+        let stubbed = self.xmss_stubbed && pq;
         let transition = stf::apply_block(
             &self.spec,
             &mut fork,
@@ -726,8 +640,34 @@ impl BeaconStateTile {
             self.stf_scratch.votes.recycle(votes);
             return Err(e);
         }
+        let at = Nanos::now();
 
-        Ok(AppliedBlock::commit(fork, &parsed.header, parsed.fork, votes))
+        let gate = if !pq {
+            StfGate::Now
+        } else {
+            // The STF collected the claims only for a PQ block it verified.
+            let proofs = if stubbed {
+                Some(0)
+            } else {
+                let validators = &fork.read().validators;
+                self.leanvm_verifier.stark_proofs_valid(&self.stf_scratch.stark, data, validators)
+            };
+            match proofs {
+                Some(0) => StfGate::NoAttestations,
+                Some(_) => StfGate::Verify,
+                None => {
+                    silver_log::warn!(
+                        block = hex32(&parsed.block_root),
+                        "leanVM rejected the block's STARK proofs"
+                    );
+                    self.stf_scratch.votes.recycle(votes);
+                    return Err(Error::StarkProofInvalid);
+                }
+            }
+        };
+
+        let applied = AppliedBlock::commit(fork, &parsed.header, parsed.fork, votes);
+        Ok((applied, StfDone { at, gate }))
     }
 
     /// Fork-choice import and head publish; the tick-to-attestable window
@@ -887,9 +827,6 @@ impl BeaconStateTile {
         }
         if self.held.is_staged(&block_root) {
             return Err(PrecheckError::AwaitingData { block_root });
-        }
-        if self.held.is_awaiting_verify(&block_root) {
-            return Err(PrecheckError::AwaitingVerify { block_root });
         }
         if let Some(reason) = self.held.rejected_reason(&block_root) {
             return Err(PrecheckError::Rejected { block_root, reason });

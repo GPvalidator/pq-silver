@@ -2514,7 +2514,7 @@ impl BeaconStateTile {
             claim(xmss_pubkey(view.validators.pubkey(attester as usize)), &message)
         });
         let merge_claims = merges.then(|| claims.clone().collect());
-        if !self.leanvm_verifier.judge(claims, SignedAggregateAndProofPqView::proof(signed)) {
+        if !self.leanvm_verifier.verify(claims, SignedAggregateAndProofPqView::proof(signed)) {
             return Feedback::reject("STARK proof invalid");
         }
         self.commit_pq_aggregate(signed, votes, coverage, merge_claims)
@@ -2851,14 +2851,14 @@ impl BeaconStateTile {
                 Self::local_verdict(&m, feedback, producers)
             }
             Feedback::BlockKnown(_) => Self::local_verdict(&m, feedback, producers),
-            Feedback::BlockImported(_) | Feedback::AwaitData(_) | Feedback::AwaitVerify(_) => {}
+            Feedback::BlockImported(_) | Feedback::AwaitData(_) => {}
         }
         true
     }
 
     /// A local block the parse did not relay, held by a `consensus` level or
     /// staged before it arrived, is relayed once its transition has passed; a
-    /// block waiting on its columns or its STARK verdict has passed it.
+    /// block waiting on its columns has passed it.
     pub(super) fn relay_once_applied(
         &self,
         m: &NewGossipMsg,
@@ -2866,9 +2866,7 @@ impl BeaconStateTile {
         feedback: Feedback,
         producers: &mut Producers,
     ) {
-        let (Feedback::BlockImported(block_root) |
-        Feedback::AwaitData(block_root) |
-        Feedback::AwaitVerify(block_root)) = feedback
+        let (Feedback::BlockImported(block_root) | Feedback::AwaitData(block_root)) = feedback
         else {
             return;
         };

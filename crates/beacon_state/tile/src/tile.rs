@@ -114,8 +114,6 @@ pub enum Feedback {
         block_root: B256,
     },
     AwaitData(B256),
-    /// Applied, and out of fork choice until leanVM verifies its STARK proofs.
-    AwaitVerify(B256),
     AwaitParentPayload {
         parent_root: B256,
         block_root: B256,
@@ -149,7 +147,6 @@ impl Debug for Feedback {
                 hex32(block_root)
             ),
             Self::AwaitData(r) => write!(f, "AwaitData(0x{})", hex32(r)),
-            Self::AwaitVerify(r) => write!(f, "AwaitVerify(0x{})", hex32(r)),
             Self::AwaitParentPayload { parent_root, block_root } => write!(
                 f,
                 "AwaitPayload(parent=0x{}, block=0x{})",
@@ -1329,7 +1326,7 @@ impl BeaconStateTile {
     /// Spec vectors stub XMSS, so every PQ signature and STARK proof passes.
     pub fn ef_stub_xmss(&mut self) {
         self.xmss_stubbed = true;
-        self.leanvm_verifier = LeanVmVerifier::fixed(true);
+        self.leanvm_verifier = LeanVmVerifier::Fixed(true);
     }
 
     pub fn ef_tick(&mut self, since_genesis_ms: u64) {
@@ -1576,12 +1573,6 @@ impl Tile<SilverSpine> for BeaconStateTile {
         } else {
             self.syncing_loop(adapter)
         }
-        // A settled proof may import a block whose own proofs then queue.
-        while let Some((request_id, verdict)) = self.leanvm_verifier.take_verdict() {
-            self.settle_proof(request_id, verdict, &mut adapter.producers);
-            adapter.mark_work();
-        }
-
         if self.fork_choice.take_head_moved() {
             self.announce_head_change(&mut adapter.producers);
         }
