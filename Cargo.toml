@@ -206,7 +206,6 @@ tracing = "0.1.40"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 typenum = "1"
-uint = "0.9"
 ureq = { version = "2", default-features = false }
 x509-parser = { version = "0.17", features = ["verify"] }
 yasna = "0.5"

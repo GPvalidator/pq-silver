@@ -28,21 +28,11 @@ use std::{
 
 use flux::utils::ArrayVec;
 use silver_common::NodeId;
-use u256::U256;
 
-// `uint`'s macro expands to code Rust 1.99 deprecates and warns about.
-#[allow(deprecated, semicolon_in_expressions_from_non_local_macros)]
-mod u256 {
-    uint::construct_uint! {
-        pub(super) struct U256(4);
-    }
-}
-
-/// A node's position in the Kademlia keyspace.
+/// A node's position in the Kademlia keyspace: its node id, read big-endian.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Key {
     preimage: NodeId,
-    hash: U256,
 }
 
 impl Key {
@@ -52,13 +42,14 @@ impl Key {
 
     /// XOR distance between two keys.
     pub fn distance(&self, other: &Key) -> Distance {
-        Distance(self.hash ^ other.hash)
+        let (a, b) = (self.preimage.raw(), other.preimage.raw());
+        Distance(std::array::from_fn(|i| a[i] ^ b[i]))
     }
 }
 
 impl From<NodeId> for Key {
     fn from(node_id: NodeId) -> Self {
-        Key { preimage: node_id, hash: U256::from_big_endian(&node_id.raw()) }
+        Key { preimage: node_id }
     }
 }
 
@@ -68,14 +59,19 @@ impl AsRef<Key> for Key {
     }
 }
 
-/// XOR distance between two `Key`s.
+/// XOR distance between two `Key`s, big-endian, so derived `Ord` is numeric.
 #[derive(Copy, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Debug)]
-pub struct Distance(U256);
+pub struct Distance([u8; 32]);
 
 impl Distance {
     /// log2 distance (FindNode bucket index, 1..=256); 0 for identical keys.
     pub fn log2(&self) -> u64 {
-        NUM_BUCKETS as u64 - self.0.leading_zeros() as u64
+        (NUM_BUCKETS - self.leading_zeros()) as u64
+    }
+
+    fn leading_zeros(&self) -> usize {
+        let Some(i) = self.0.iter().position(|&b| b != 0) else { return NUM_BUCKETS };
+        i * 8 + self.0[i].leading_zeros() as usize
     }
 }
 
@@ -329,7 +325,7 @@ struct BucketIndex(usize);
 
 impl BucketIndex {
     fn new(d: &Distance) -> Option<BucketIndex> {
-        (NUM_BUCKETS - d.0.leading_zeros() as usize).checked_sub(1).map(BucketIndex)
+        (NUM_BUCKETS - d.leading_zeros()).checked_sub(1).map(BucketIndex)
     }
 
     fn get(self) -> usize {
@@ -353,6 +349,22 @@ mod tests {
             table.insert_or_update(&local_key, (), Instant::now()),
             InsertResult::Failed(FailureReason::SelfUpdate)
         ));
+    }
+
+    // Distances order numerically, so the first byte outweighs the last.
+    #[test]
+    fn distance_orders_big_endian_and_logs_its_top_bit() {
+        let id = |byte: usize, value: u8| {
+            let mut raw = [0; 32];
+            raw[byte] = value;
+            Key::from(NodeId::new(&raw))
+        };
+        let zero = id(0, 0);
+        let (low, high) = (zero.distance(&id(31, 0xff)), zero.distance(&id(0, 1)));
+        assert!(Distance::default() < low && low < high);
+        assert_eq!((zero.distance(&zero).log2(), low.log2(), high.log2()), (0, 8, 249));
+        assert_eq!(zero.distance(&id(0, 0x80)).log2(), 256);
+        assert_eq!(id(0, 0x80).distance(&id(0, 0x81)), high);
     }
 
     // Random peers do NOT spread evenly across the 256 buckets. Bucket index is

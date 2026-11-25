@@ -6963,7 +6963,6 @@ dependencies = [
  "silver_config",
  "silver_log",
  "thiserror 1.0.69",
- "uint",
 ]
 
 [[package]]
