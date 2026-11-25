@@ -7689,7 +7689,6 @@ mod leanvm_verifier {
         let proof = proof.to_bytes();
 
         let mut verifier = LeanVmVerifier::default();
-        LeanVmVerifier::warm_up();
         assert!(verifier.verify(claims.iter().copied(), &proof));
         assert!(!verifier.verify(claims[1..].iter().copied(), &proof), "a claim short");
     }

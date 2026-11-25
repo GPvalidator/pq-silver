@@ -7065,6 +7065,7 @@ name = "silver_leanvm"
 version = "0.1.0-alpha.17"
 dependencies = [
  "flux",
+ "flux-profiler",
  "lean_vm",
  "silver_common",
  "silver_log",

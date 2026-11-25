@@ -1555,7 +1555,6 @@ impl Tile<SilverSpine> for BeaconStateTile {
             "the beacon_state tcache must hold a leanVM request of {MAX_REQUEST_LEN} bytes"
         );
         self.slashing_pool.with_producer(adapter.producers.beacon_events);
-        LeanVmVerifier::warm_up();
         true
     }
 

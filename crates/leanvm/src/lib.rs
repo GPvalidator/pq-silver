@@ -16,9 +16,10 @@
 mod tests;
 mod wire;
 
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
 
 use flux::{spine::SpineAdapter, tile::Tile, utils::try_thread_boot};
+use flux_profiler::timed;
 use lean_vm::{AggregateProof, OutputClaims};
 use silver_common::{
     IngestionTime, LeanVmHealthEvent, LeanVmReq, LeanVmResp, SilverSpine, TCacheError, TCacheId,
@@ -194,13 +195,13 @@ fn copy_body(reader: &mut TCacheReader, req: LeanVmReq) -> Option<Vec<u8>> {
 ///
 /// The pool's workers inherit the calling thread's CPU set, so it spans
 /// every prover core while they start.
+#[timed]
 fn start_prover(cores: &[usize]) {
-    let started = Instant::now();
     try_thread_boot(cores, None).expect("pin to the leanvm cores");
     lean_vm::setup(cores.len());
     try_thread_boot(&cores[..1], None).expect("pin to the leanvm tile core");
     warm_up();
-    silver_log::info!(?cores, elapsed = ?started.elapsed(), "leanvm prover started");
+    silver_log::info!(?cores, "leanvm prover started");
 }
 
 /// A fresh process's first proofs are slower, touching memory the allocator
@@ -219,12 +220,12 @@ fn warm_up() {
 }
 
 /// The response to an `aggregate` body. Proves on the calling thread.
+#[timed]
 fn prove(body: &[u8]) -> Vec<u8> {
     let request = match wire::decode_aggregate(body) {
         Ok(request) => request,
         Err(refusal) => return refuse(&refusal),
     };
-    let started = Instant::now();
     let shape = (request.children.len(), request.raw_lean_xmss.len(), request.log_inv_rate);
     let children = request
         .children
@@ -261,14 +262,13 @@ fn prove(body: &[u8]) -> Vec<u8> {
         request.log_inv_rate,
     );
     let (children, signatures, rate) = shape;
-    let elapsed = started.elapsed();
     match outcome {
         Ok((claims, proof)) => {
-            silver_log::info!(children, signatures, rate, ?elapsed, "leanvm proven");
+            silver_log::info!(children, signatures, rate, "leanvm proven");
             wire::encode_proven(&claims, &proof.to_bytes())
         }
         Err(error) => {
-            silver_log::warn!(children, signatures, rate, ?elapsed, %error, "leanvm refused");
+            silver_log::warn!(children, signatures, rate, %error, "leanvm refused");
             Refusal { why: error.into(), message: error.to_string() }.encode()
         }
     }

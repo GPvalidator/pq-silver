@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 flux.workspace = true
+flux-profiler.workspace = true
 lean_vm.workspace = true
 silver_common.workspace = true
 silver_log.workspace = true

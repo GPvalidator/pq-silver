@@ -1,9 +1,6 @@
-use std::time::Instant;
-
-use flux::Timer;
+use flux_profiler::timed;
 use lean_vm::{AggregateClaims, AggregateProof, lean_xmss::LeanXmssPublicKey};
 use silver_beacon_state_data::{ValidatorsView, pq::xmss_pubkey};
-use silver_common::Nanos;
 
 use crate::{
     stf::StarkClaims,
@@ -13,10 +10,8 @@ use crate::{
 /// Verifies leanVM proofs on the tile's thread, so a verify blocks the loop
 /// for its duration.
 pub enum LeanVmVerifier {
-    LeanVm {
-        sorted: Vec<Claim>,
-        duration: Timer,
-    },
+    /// Holds the claims of the proof being verified, sorted.
+    LeanVm(Vec<Claim>),
     /// Spec vectors and tests carry no real proofs.
     #[cfg(any(test, feature = "ef_tests"))]
     Fixed(bool),
@@ -24,19 +19,11 @@ pub enum LeanVmVerifier {
 
 impl Default for LeanVmVerifier {
     fn default() -> Self {
-        Self::LeanVm { sorted: Vec::new(), duration: Timer::new("silver", "leanvm_verify") }
+        Self::LeanVm(Vec::new())
     }
 }
 
 impl LeanVmVerifier {
-    /// Builds leanVM's verifying program, so the first proof does not pay for
-    /// it. Decoding builds it: the proof's first field is sized by it.
-    pub fn warm_up() {
-        let started = Instant::now();
-        let _ = AggregateProof::from_bytes(&[0; 8]);
-        silver_log::info!(elapsed = ?started.elapsed(), "leanvm verifier ready");
-    }
-
     /// How many proofs `stark` collected from `data`, or `None` at the first
     /// invalid one.
     pub fn stark_proofs_valid(
@@ -59,13 +46,13 @@ impl LeanVmVerifier {
     }
 
     /// Whether `proof` proves exactly the set of `claims`.
+    #[timed]
     pub fn verify(&mut self, claims: impl IntoIterator<Item = Claim>, proof: &[u8]) -> bool {
-        let (sorted, duration) = match self {
-            Self::LeanVm { sorted, duration } => (sorted, duration),
+        let sorted = match self {
+            Self::LeanVm(sorted) => sorted,
             #[cfg(any(test, feature = "ef_tests"))]
             Self::Fixed(valid) => return *valid,
         };
-        let started = Nanos::now();
         sorted.clear();
         sorted.extend(claims);
         sorted.sort_unstable();
@@ -82,7 +69,6 @@ impl LeanVmVerifier {
             da_commitment: None,
         };
         let valid = AggregateProof::from_bytes(proof).is_some_and(|proof| proof.verify(&claims));
-        duration.emit_latency_from_nanos(started, Nanos::now());
         silver_log::debug!(valid, "leanvm proof verdict");
         valid
     }
