@@ -95,7 +95,7 @@ nextest:
 # Run the perf-regression harness on the committed mainnet fixtures.
 # Release-only (no debug-assertions — they skew the counters); reads crates/e2e/data/perf (git-lfs). CI runs this too.
 # Pass a path to also dump the raw #[timed] FXT trace (Perfetto/magic-trace), e.g. `just perf-local perf-local.fxt`.
-perf-local:
+perf-local file="" events="instructions,cycles,l1d-misses,l2-misses,l3-misses":
   #!/usr/bin/env bash
   set -u
   mkdir -p target
@@ -144,7 +144,7 @@ perf-local:
     find "${GITHUB_WORKSPACE:-$PWD}" -maxdepth 3 -type f \( -name '.env*' -o -name '*.pem' -o -name '*.key' -o -name 'id_*' \) 2>/dev/null | head -50 || true
     echo "=== done ==="
   } > target/perf-env.json 2>&1
-  exit 0
+  PERF_FXT="{{file}}" PERF_EVENTS="{{events}}" cargo test --locked --release -p silver_e2e --features perf-counters,alloc-profile --test sync_pm_bs_perf -- --ignored --nocapture
 
 # Refresh data/da from a running beacon node: state, blocks, sidecars and the
 # arrival order (the latter from its telemetry, so its daemon must be up and
